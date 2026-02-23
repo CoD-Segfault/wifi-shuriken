@@ -1,0 +1,464 @@
+#include <Arduino.h>
+#include "spi_protocol_shared.h"
+#include "wifi_dedupe.h"
+#include "wifi_result_utils.h"
+#include "scanner_platform_esp32_radio.h"
+#include "scanner_platform_esp32_spi.h"
+
+/*
+  ===== SPI RESPONSE TIMING (IMPORTANT) =====
+  With SPI slave + spi_slave_transmit(), the slave must have tx_buf filled BEFORE the master clocks.
+  That means the response to a command is available on the *next* SPI transaction.
+
+  Recommended master pattern (simple):
+    1) TX CMD_xxxxx (ignore RX)
+    2) TX CMD_NOP   (read RX = response to CMD_xxxxx)
+
+  Or pipeline (more efficient):
+    - Each transaction sends the next command while receiving the previous command's response.
+*/
+
+#ifndef PIN_SCK
+#define PIN_SCK   6
+#endif
+#ifndef PIN_MOSI
+#define PIN_MOSI  1
+#endif
+#ifndef PIN_MISO
+#define PIN_MISO  0
+#endif
+#ifndef PIN_CS
+#define PIN_CS    24
+#endif
+
+// ---------- Debug ----------
+#ifndef DEBUG_SPI_PROTOCOL
+#define DEBUG_SPI_PROTOCOL 0
+#endif
+
+#if DEBUG_SPI_PROTOCOL
+#define DBG_PRINTF(...) Serial.printf(__VA_ARGS__)
+#define DBG_PRINTLN(x) Serial.println(x)
+#else
+#define DBG_PRINTF(...)
+#define DBG_PRINTLN(x)
+#endif
+
+// ---------- Scan tuning ----------
+static constexpr int ACTIVE_DWELL_MS  = 110;
+static constexpr int PASSIVE_DWELL_MS = 210;
+static constexpr uint8_t BAND_5_GHZ = 5;
+static constexpr uint32_t SPI_RX_TIMEOUT_MS = 50;
+static constexpr uint8_t SPI_TRANSACTION_QUEUE_SIZE = 4;
+
+enum ScanStatus : int8_t {
+  SCAN_STATUS_OK = 0,
+  SCAN_STATUS_BUSY = -1,
+  SCAN_STATUS_INVALID = -2,
+  SCAN_STATUS_START_FAILED = -3,
+};
+
+// ---------- Fixed SPI frame size ----------
+// Keep a fixed frame size for all transactions (simplifies master & DMA alignment).
+static constexpr size_t FRAME_SIZE = SPI_FRAME_SIZE;
+static constexpr size_t FRAME_TAG_INDEX = SPI_FRAME_TAG_INDEX;
+
+static uint8_t rx_buf[FRAME_SIZE] __attribute__((aligned(4)));
+static uint8_t tx_buf[FRAME_SIZE] __attribute__((aligned(4)));
+
+// ---------- Scan state ----------
+// Two-stage pipeline:
+// 1) Radio scan snapshot lifecycle (scan_active / scan_processing / scan_count / scan_index).
+// 2) SPI-visible deduped buffer lifecycle (spi_results / spi_result_count / spi_result_index / spi_status).
+static bool scan_active = false;
+static bool scan_processing = false;
+static int scan_count = 0;     // total results in current scan snapshot
+static int scan_index = 0;     // next raw result index to process
+static WiFiResult spi_results[PROTO_MAX_RESULTS] = {};
+static uint8_t spi_result_count = 0;
+static uint8_t spi_result_index = 0;
+// Master-visible status: 0=idle, -1=busy (scan/processing), >0=buffered results available.
+static int8_t spi_status = SCAN_STATUS_OK;
+static uint8_t last_scan_band = 0;
+static uint8_t last_scan_channel = 0;
+static WiFiDedupeHash scan_dedupe_storage[WIFI_DEDUPE_TABLE_CAPACITY];
+static WiFiDedupeTable scan_dedupe_table = {};
+#if LOG_DEDUPE_HITS
+static uint32_t scan_dedupe_hits = 0;
+static uint32_t scan_dedupe_logs = 0;
+#endif
+
+// Optional: immediate status for CMD_SCAN response (returned next transaction)
+static int8_t last_scan_status = SCAN_STATUS_OK;
+
+// ---------- Helpers ----------
+static const char* cmd_to_str(uint8_t cmd) {
+  switch (static_cast<SpiCommand>(cmd)) {
+    case CMD_NOP: return "NOP";
+    case CMD_ID: return "ID";
+    case CMD_SCAN: return "SCAN";
+    case CMD_RESULT_COUNT: return "RESULT_COUNT";
+    case CMD_RESULT_GET: return "RESULT_GET";
+    case CMD_DEDUPE_RESET: return "DEDUPE_RESET";
+    default: return "UNKNOWN";
+  }
+}
+
+static bool is_dfs_channel(uint8_t band, uint8_t channel) {
+  // DFS definition for your use case: 5GHz channels 52-144
+  return (band == BAND_5_GHZ) && (channel >= 52) && (channel <= 144);
+}
+
+static void clear_scan_results() {
+  if (scan_count > 0) {
+    // Release backend snapshot memory once we have consumed/aborted it.
+    scannerRadioDeleteScanResults();
+  }
+  scan_count = 0;
+  scan_index = 0;
+  scan_processing = false;
+#if LOG_DEDUPE_HITS
+  scan_dedupe_hits = 0;
+  scan_dedupe_logs = 0;
+#endif
+}
+
+static void clear_spi_result_buffer() {
+  spi_result_count = 0;
+  spi_result_index = 0;
+}
+
+static void write_status_response(int8_t value) {
+  memcpy(tx_buf, &value, 1);
+}
+
+#if LOG_DEDUPE_HITS
+static void noteDedupeHit(int index, const WiFiResult& r) {
+  scan_dedupe_hits++;
+  if (scan_dedupe_logs < LOG_DEDUPE_HITS_MAX_PER_SCAN) {
+    Serial.printf("[SLAVE] dedupe hit idx=%d ssid='%s' ch=%u band=%u rssi=%d\n",
+                  index, r.ssid, r.channel, r.band, r.rssi);
+    scan_dedupe_logs++;
+  }
+}
+
+static void logDedupeSuppressedSummary() {
+  if (scan_dedupe_hits > scan_dedupe_logs) {
+    Serial.printf("[SLAVE] dedupe hits suppressed: %lu (total=%lu)\n",
+                  (unsigned long)(scan_dedupe_hits - scan_dedupe_logs),
+                  (unsigned long)scan_dedupe_hits);
+  }
+}
+#endif
+
+static void process_scan_results_into_spi_buffer(int budget = 4) {
+  if (!scan_processing) {
+    return;
+  }
+
+  // Budgeted draining keeps loop latency bounded when scans are dense.
+  int processed = 0;
+  while (scan_index < scan_count &&
+         spi_result_count < PROTO_MAX_RESULTS &&
+         processed < budget) {
+    WiFiResult r = {};
+    if (!scannerRadioReadResult(scan_index, r)) {
+      // Skip unreadable raw entries but keep progressing the snapshot cursor.
+      scan_index++;
+      processed++;
+      continue;
+    }
+    scan_index++;
+    processed++;
+
+    if (!wifiResultIsValidForDedupe(r)) {
+      // Ignore invalid radio results so they don't poison dedupe state.
+      continue;
+    }
+
+    WiFiDedupeHash hash = {};
+    wifiDedupeHashFromResult(r, hash);
+    if (!wifiDedupeTableRemember(&scan_dedupe_table, &hash)) {
+#if LOG_DEDUPE_HITS
+      noteDedupeHit(scan_index - 1, r);
+#endif
+      continue;
+    }
+
+    spi_results[spi_result_count++] = r;
+  }
+
+  // When all raw entries are consumed (or protocol buffer is full),
+  // publish the final count to the master as the new status.
+  if (scan_index >= scan_count || spi_result_count >= PROTO_MAX_RESULTS) {
+#if LOG_DEDUPE_HITS
+    logDedupeSuppressedSummary();
+#endif
+    clear_scan_results();
+    spi_status = static_cast<int8_t>(spi_result_count);
+    Serial.printf("Buffered %u unique results (band %u ch %u)\n",
+                  (unsigned)spi_result_count, last_scan_band, last_scan_channel);
+  }
+}
+
+static void start_channel_scan(uint8_t band, uint8_t channel) {
+  // Discard any previous snapshot before starting a new scan.
+  clear_scan_results();
+  clear_spi_result_buffer();
+  spi_status = SCAN_STATUS_OK;
+
+  // DFS channels should be passive to avoid radar CAC delays, 210ms dwell
+  const bool passive = is_dfs_channel(band, channel);
+  const int dwell = passive ? PASSIVE_DWELL_MS : ACTIVE_DWELL_MS;
+
+  // Save scan metadata for completion logs.
+  last_scan_band = band;
+  last_scan_channel = channel;
+
+  // Start the WiFi scan on the specified channel (async)
+  // scanNetworks(bool async, bool show_hidden, bool passive, uint32_t max_ms_per_chan, uint8_t channel)
+  const int n = scannerRadioStartAsyncScan(band, channel, passive, dwell);
+  DBG_PRINTF("[SCAN] start request band=%u ch=%u passive=%d dwell=%d ret=%d\n",
+             band, channel, passive ? 1 : 0, dwell, n);
+
+  if (n == SCANNER_RADIO_SCAN_FAILED) {
+    Serial.printf("Scan start failed on band %u ch %u (ret=%d)\n", band, channel, n);
+    scan_active = false;
+    scan_processing = false;
+    last_scan_status = SCAN_STATUS_START_FAILED;
+    spi_status = SCAN_STATUS_OK;
+    return;
+  }
+
+  scan_active = true;
+  scan_processing = false;
+  last_scan_status = SCAN_STATUS_OK;
+  spi_status = SCAN_STATUS_BUSY;
+  Serial.printf("Started scan band %u ch %u (%s, %dms, ret=%d)\n",
+                band, channel, passive ? "passive" : "active", dwell, n);
+}
+
+static void update_scan_state() {
+  // Phase 1: poll radio async state until scan snapshot is complete.
+  if (scan_active) {
+    const int n = scannerRadioPollAsyncScan();
+
+    if (n == SCANNER_RADIO_SCAN_RUNNING) {
+      return;
+    }
+
+    if (n < 0) {
+      // Failed or aborted.
+      clear_scan_results();
+      clear_spi_result_buffer();
+      scan_active = false;
+      scan_processing = false;
+      spi_status = SCAN_STATUS_OK;
+      Serial.println("Scan failed/aborted");
+      return;
+    }
+
+    // Scan completed: keep status busy while we process and dedupe.
+    scan_active = false;
+    scan_processing = true;
+    scan_index = 0;
+    spi_status = SCAN_STATUS_BUSY;
+
+    // Safety: enforce protocol max.
+    if (n > PROTO_MAX_RESULTS) {
+      Serial.printf("Warning: scan returned %d results; clamping to %u\n",
+                    n, (unsigned)PROTO_MAX_RESULTS);
+      scan_count = PROTO_MAX_RESULTS;
+    } else {
+      scan_count = n;
+    }
+
+    Serial.printf("Scan complete: %d results (band %u ch %u)\n",
+                  scan_count, last_scan_band, last_scan_channel);
+  }
+
+  // Phase 2: post-process raw snapshot into deduped SPI buffer.
+  if (scan_processing) {
+    process_scan_results_into_spi_buffer();
+  }
+}
+
+// Prepare a WiFiResultPacket into tx_buf (first 48 bytes).
+static void write_result_packet(ResultType type, const WiFiResult* r = nullptr) {
+  WiFiResultPacket pkt = {};
+  pkt.result_type = static_cast<uint8_t>(type);
+  if (r) {
+    pkt.result = *r;
+  }
+  // pkt padded automatically by zero init
+  memcpy(tx_buf, &pkt, sizeof(pkt));
+}
+
+// ---------- Command handling ----------
+// This fills tx_buf with the *next* response (to be clocked out on the next transaction).
+static void handle_command(uint8_t cmd_byte) {
+  // Clear tx_buf each time so short responses don't leak old data.
+  memset(tx_buf, 0, FRAME_SIZE);
+  // Tag the frame with the command this response corresponds to.
+  tx_buf[FRAME_TAG_INDEX] = cmd_byte;
+
+  const SpiCommand cmd = static_cast<SpiCommand>(cmd_byte);
+  DBG_PRINTF("[SPI] cmd=0x%02X (%s) rx[1..3]=%u,%u,%u\n",
+             cmd_byte, cmd_to_str(cmd_byte), rx_buf[1], rx_buf[2], rx_buf[3]);
+
+  switch (cmd) {
+    case CMD_NOP: {
+      // Return result_count semantics as a convenience.
+      const int8_t c = spi_status;
+      write_status_response(c);
+      DBG_PRINTF("[SPI] rsp NOP => count=%d\n", c);
+      break;
+    }
+
+    case CMD_ID: {
+      DeviceIdReply id = {};
+      id.proto_version = PROTO_VERSION;
+      id.scanner_type  = SCANNER_TYPE_ESP32_C5;
+      id.capabilities  = (CAP_BAND_24GHZ | CAP_BAND_5GHZ);
+      id.max_results   = PROTO_MAX_RESULTS;
+      memcpy(tx_buf, &id, sizeof(id));
+      DBG_PRINTF("[SPI] rsp ID => proto=%u type=%u caps=0x%02X max=%u\n",
+                 id.proto_version, id.scanner_type, id.capabilities, id.max_results);
+      break;
+    }
+
+    case CMD_SCAN: {
+      // Note: response comes next transaction: we return last_scan_status (int8_t)
+      ScanCommand sc = {};
+      memcpy(&sc, rx_buf, sizeof(sc));
+
+      // Reject new scans while a previous scan/snapshot/buffer is still in flight.
+      if (scan_active || scan_processing || spi_status > 0) {
+        last_scan_status = SCAN_STATUS_BUSY;
+      } else if (!wifiBandChannelValid(sc.band, sc.channel)) {
+        last_scan_status = SCAN_STATUS_INVALID;
+        DBG_PRINTF("[SCAN] invalid request raw=%02X,%02X,%02X,%02X\n",
+                   rx_buf[0], rx_buf[1], rx_buf[2], rx_buf[3]);
+      } else {
+        last_scan_status = SCAN_STATUS_OK;
+        start_channel_scan(sc.band, sc.channel);
+      }
+
+      write_status_response(last_scan_status);
+      DBG_PRINTF("[SPI] rsp SCAN => status=%d (band=%u ch=%u)\n",
+                 last_scan_status, sc.band, sc.channel);
+      break;
+    }
+
+    case CMD_RESULT_COUNT: {
+      update_scan_state(); // ensure we progress scan completion even if master polls slowly
+      const int8_t c = spi_status;
+      write_status_response(c);
+      DBG_PRINTF("[SPI] rsp RESULT_COUNT => %d (active=%d total=%d idx=%d)\n",
+                 c, scan_active ? 1 : 0, scan_count, scan_index);
+      break;
+    }
+
+    case CMD_RESULT_GET: {
+      update_scan_state();
+
+      if (spi_status == SCAN_STATUS_BUSY) {
+        write_result_packet(RESULT_BUSY);
+        DBG_PRINTLN("[SPI] rsp RESULT_GET => BUSY");
+        break;
+      }
+
+      // No buffered results ready -> end marker.
+      if (spi_status <= 0 || spi_result_count == 0 || spi_result_index >= spi_result_count) {
+        write_result_packet(RESULT_END);
+        DBG_PRINTLN("[SPI] rsp RESULT_GET => END");
+        // END always collapses transfer state back to idle.
+        spi_status = SCAN_STATUS_OK;
+        clear_spi_result_buffer();
+        break;
+      }
+
+      const WiFiResult& r = spi_results[spi_result_index++];
+      write_result_packet(RESULT_WIFI, &r);
+
+      const int remaining = (int)spi_result_count - (int)spi_result_index;
+      if (remaining > 0) {
+        spi_status = static_cast<int8_t>(remaining);
+      } else {
+        spi_status = SCAN_STATUS_OK;
+        clear_spi_result_buffer();
+      }
+
+      DBG_PRINTF("[SPI] rsp RESULT_GET => WIFI out=%u/%u ssid='%s' rssi=%d ch=%u band=%u\n",
+                 (unsigned)spi_result_index, (unsigned)spi_result_count,
+                 r.ssid, r.rssi, r.channel, r.band);
+      break;
+    }
+
+    case CMD_DEDUPE_RESET: {
+      // Keep slave dedupe reset boot-only.
+      write_status_response(0);
+      DBG_PRINTLN("[SPI] rsp DEDUPE_RESET => ignored");
+      break;
+    }
+
+    default:
+      // Unknown command: return 0
+      DBG_PRINTF("[SPI] rsp UNKNOWN cmd=0x%02X\n", cmd_byte);
+      break;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  // Keep reboot-to-SPI-ready latency low so the Pico can recover quickly.
+  delay(100);
+
+  Serial.println("ESP32-C5 Scanner (Arduino WiFi + SPI slave, command protocol)");
+
+  if (!scannerRadioInit()) {
+    Serial.println("scannerRadioInit failed");
+    while (1) delay(1000);
+  }
+  delay(100);
+
+  if (!scannerSpiSlaveInit(PIN_SCK, PIN_MOSI, PIN_MISO, PIN_CS,
+                           FRAME_SIZE, SPI_TRANSACTION_QUEUE_SIZE)) {
+    Serial.println("scannerSpiSlaveInit failed");
+    while (1) delay(1000);
+  }
+
+  memset(rx_buf, 0, FRAME_SIZE);
+  memset(tx_buf, 0, FRAME_SIZE);
+  wifiDedupeTableInit(&scan_dedupe_table, scan_dedupe_storage, WIFI_DEDUPE_TABLE_CAPACITY);
+  wifiDedupeTableReset(&scan_dedupe_table);
+
+  Serial.println("SPI slave ready");
+}
+
+void loop() {
+  // Always progress scan state even if the master is quiet.
+  update_scan_state();
+
+  // Ensure rx_buf doesn't contain stale data (not strictly required, but helps debugging).
+  memset(rx_buf, 0, FRAME_SIZE);
+
+  // Wait for a SPI transaction; use a timeout so we can keep scanComplete() ticking.
+  const int ret = scannerSpiSlaveTransfer(tx_buf, rx_buf, FRAME_SIZE, SPI_RX_TIMEOUT_MS);
+
+  if (ret == SCANNER_SPI_TRANSFER_TIMEOUT) {
+    // No SPI activity this slice; keep looping to update scan state.
+    return;
+  }
+  if (ret != SCANNER_SPI_TRANSFER_OK) {
+    // SPI error; keep going
+    DBG_PRINTF("[SPI] spi_slave_transmit error: %d\n", ret);
+    return;
+  }
+
+  // Transaction completed: rx_buf now contains the command from the master.
+  const uint8_t cmd = rx_buf[0];
+
+  // Prepare response for the NEXT transaction (pipelined slave semantics).
+  handle_command(cmd);
+}

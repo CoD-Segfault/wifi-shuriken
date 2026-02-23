@@ -1,0 +1,104 @@
+#pragma once
+
+#include <Arduino.h>
+#include <SdFat.h>
+#include <TinyGPSPlus.h>
+
+#include <stddef.h>
+#include <stdint.h>
+
+namespace pico_logging {
+
+struct QueuedScanResult {
+  char ssid[33];
+  uint8_t bssid[6];
+  int8_t rssi;
+  uint8_t channel;
+  uint8_t band;
+  uint16_t capabilities;
+};
+
+struct Config {
+  uint8_t sd_pin_cs;
+  const uint32_t* sd_spi_clocks_hz;
+  size_t sd_spi_clock_count;
+  uint32_t sd_init_retry_delay_ms;
+  uint32_t sd_retry_background_ms;
+  uint32_t gnss_boot_timestamp_wait_ms;
+  uint8_t gnss_boot_timestamp_reads;
+  uint32_t gps_field_max_age_ms;
+  uint32_t wigle_time_wait_retry_ms;
+  uint32_t wigle_flush_interval_ms;
+  uint16_t gnss_min_valid_year;
+};
+
+struct State {
+  bool sd_ready = false;
+  bool wigle_ready = false;
+  bool wigle_dirty = false;
+  bool wigle_path_selected = false;
+  bool master_clock_valid = false;
+  uint32_t sd_next_retry_ms = 0;
+  size_t sd_retry_clock_index = 0;
+  uint32_t wigle_last_flush_ms = 0;
+  uint32_t wigle_rows = 0;
+  uint32_t wigle_rows_blank_gps = 0;
+  char wigle_boot_timestamp[15] = "";
+  char wigle_log_path[40] = "";
+};
+
+void formatBssid(const uint8_t* bssid, char* out, size_t out_len);
+void wigleCsvEscape(const char* in, char* out, size_t out_len);
+void buildAndroidCapabilitiesString(uint16_t caps, char* out, size_t out_len);
+
+class Logger {
+ public:
+  Logger(SdFat& sd,
+         FsFile& log_file,
+         TinyGPSPlus& gps,
+         HardwareSerial& gnss_uart,
+         Stream& serial,
+         const Config& config,
+         State& state);
+
+  void initUtcTimezone();
+  void registerSdDateTimeCallback();
+
+  void syncMasterClockFromGnss();
+  bool ensureBootTimestampFromClock();
+  void captureBootTimestampFromGnss();
+
+  bool selectWigleLogPath();
+  bool mountSdWithRetries(int max_attempts);
+  bool initWigleCsv(const char* path);
+
+  void disableSdLoggingAndScheduleRetry(const char* reason);
+  void tryRecoverSdLogging();
+
+  void appendWigleRow(const QueuedScanResult& r);
+  void flushWigleIfDue();
+
+ private:
+  static Logger* date_time_callback_instance_;
+  static void sdDateTimeCallbackThunk(uint16_t* date, uint16_t* time);
+  void sdDateTimeCallback(uint16_t* date, uint16_t* time);
+
+  bool gnssDateTimeValid() const;
+  bool gnssDateTimeToTmUtc(struct tm& tm_out) const;
+  bool masterClockNowEpochSeconds(uint32_t& epoch_out) const;
+  void formatGpsTimestamp(char* out, size_t out_len) const;
+
+  bool beginSdAtClock(uint32_t hz);
+  bool beginSdAtAnyClock();
+
+  SdFat& sd_;
+  FsFile& log_file_;
+  TinyGPSPlus& gps_;
+  HardwareSerial& gnss_uart_;
+  Stream& serial_;
+  const Config& config_;
+  State& state_;
+};
+
+}  // namespace pico_logging
+
