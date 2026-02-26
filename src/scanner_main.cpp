@@ -31,6 +31,19 @@
 #define PIN_CS    24
 #endif
 
+#ifndef LED_BUILTIN
+#define LED_BUILTIN -1
+#endif
+#ifndef SCANNER_STATUS_LED_ENABLED
+#define SCANNER_STATUS_LED_ENABLED 1
+#endif
+#ifndef SCANNER_STATUS_LED_PIN
+#define SCANNER_STATUS_LED_PIN LED_BUILTIN
+#endif
+#ifndef SCANNER_STATUS_LED_ACTIVE_LOW
+#define SCANNER_STATUS_LED_ACTIVE_LOW 0
+#endif
+
 // ---------- Debug ----------
 #ifndef DEBUG_SPI_PROTOCOL
 #define DEBUG_SPI_PROTOCOL 0
@@ -92,6 +105,26 @@ static uint32_t scan_dedupe_logs = 0;
 static int8_t last_scan_status = SCAN_STATUS_OK;
 
 // ---------- Helpers ----------
+static inline bool scannerStatusLedConfigured() {
+  return SCANNER_STATUS_LED_ENABLED && ((int)SCANNER_STATUS_LED_PIN >= 0);
+}
+
+static void scannerStatusLedWrite(bool on) {
+  if (!scannerStatusLedConfigured()) {
+    return;
+  }
+  const bool drive_high = SCANNER_STATUS_LED_ACTIVE_LOW ? !on : on;
+  digitalWrite(SCANNER_STATUS_LED_PIN, drive_high ? HIGH : LOW);
+}
+
+static void scannerStatusLedInitBootOn() {
+  if (!scannerStatusLedConfigured()) {
+    return;
+  }
+  pinMode(SCANNER_STATUS_LED_PIN, OUTPUT);
+  scannerStatusLedWrite(true);
+}
+
 static const char* cmd_to_str(uint8_t cmd) {
   switch (static_cast<SpiCommand>(cmd)) {
     case CMD_NOP: return "NOP";
@@ -196,6 +229,8 @@ static void process_scan_results_into_spi_buffer(int budget = 4) {
 #endif
     clear_scan_results();
     spi_status = static_cast<int8_t>(spi_result_count);
+    // Snapshot fully processed; scanner is now idle from RF perspective.
+    scannerStatusLedWrite(false);
     Serial.printf("Buffered %u unique results (band %u ch %u)\n",
                   (unsigned)spi_result_count, last_scan_band, last_scan_channel);
   }
@@ -227,6 +262,7 @@ static void start_channel_scan(uint8_t band, uint8_t channel) {
     scan_processing = false;
     last_scan_status = SCAN_STATUS_START_FAILED;
     spi_status = SCAN_STATUS_OK;
+    scannerStatusLedWrite(false);
     return;
   }
 
@@ -234,6 +270,7 @@ static void start_channel_scan(uint8_t band, uint8_t channel) {
   scan_processing = false;
   last_scan_status = SCAN_STATUS_OK;
   spi_status = SCAN_STATUS_BUSY;
+  scannerStatusLedWrite(true);
   Serial.printf("Started scan band %u ch %u (%s, %dms, ret=%d)\n",
                 band, channel, passive ? "passive" : "active", dwell, n);
 }
@@ -254,6 +291,7 @@ static void update_scan_state() {
       scan_active = false;
       scan_processing = false;
       spi_status = SCAN_STATUS_OK;
+      scannerStatusLedWrite(false);
       Serial.println("Scan failed/aborted");
       return;
     }
@@ -411,6 +449,7 @@ static void handle_command(uint8_t cmd_byte) {
 
 void setup() {
   Serial.begin(115200);
+  scannerStatusLedInitBootOn();
   // Keep reboot-to-SPI-ready latency low so the Pico can recover quickly.
   delay(100);
 
@@ -433,6 +472,8 @@ void setup() {
   wifiDedupeTableInit(&scan_dedupe_table, scan_dedupe_storage, WIFI_DEDUPE_TABLE_CAPACITY);
   wifiDedupeTableReset(&scan_dedupe_table);
 
+  // Boot complete: scanner is ready/idle.
+  scannerStatusLedWrite(false);
   Serial.println("SPI slave ready");
 }
 

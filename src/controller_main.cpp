@@ -18,83 +18,9 @@
 #include "spi_protocol_shared.h"
 #include "wifi_dedupe.h"
 #include "wifi_result_utils.h"
+#include "Configuration.h"
 
-// SD Card SPI pins
-#define SD_PIN_SCK    2
-#define SD_PIN_MOSI   3
-#define SD_PIN_MISO   4
-#define SD_PIN_CS     5
-
-// SD Card configuration
-#define SD_SPI_CLOCK  10000000  // 10 MHz
-#ifndef SD_MISO_PULLUP
-#define SD_MISO_PULLUP 1
-#endif
-
-// ESP32 and Shift Register SPI pins
-#define ESP_PIN_SCK   10
-#define ESP_PIN_MOSI  11
-#define ESP_PIN_MISO  12
-#ifndef SCANNER_USE_SHIFTREG_CS
-#define SCANNER_USE_SHIFTREG_CS 0
-#endif
-#if !SCANNER_USE_SHIFTREG_CS
-#define ESP_PIN_CS    13
-#endif
-#ifndef SCANNER_SHIFTREG_LATCH_PIN
-#define SCANNER_SHIFTREG_LATCH_PIN 15
-#endif
-#ifndef SCANNER_SHIFTREG_OE_PIN
-#define SCANNER_SHIFTREG_OE_PIN 16
-#endif
-#ifndef SCANNER_SHIFTREG_SPI_HZ
-#define SCANNER_SHIFTREG_SPI_HZ 2000000
-#endif
-#ifndef SCANNER_SHIFTREG_OUTPUTS
-#define SCANNER_SHIFTREG_OUTPUTS 8
-#endif
-#if SCANNER_SHIFTREG_OUTPUTS < 1 || SCANNER_SHIFTREG_OUTPUTS > 8
-#error "SCANNER_SHIFTREG_OUTPUTS must be in [1,8]"
-#endif
-#ifndef SCANNER_INITIAL_SLOT
-#define SCANNER_INITIAL_SLOT 0
-#endif
-#if SCANNER_INITIAL_SLOT < 0 || SCANNER_INITIAL_SLOT >= SCANNER_SHIFTREG_OUTPUTS
-#error "SCANNER_INITIAL_SLOT out of range for SCANNER_SHIFTREG_OUTPUTS"
-#endif
-
-// RGB LED pin and count
-#define RGB_PIN       14
-#define NUMPIXELS     1
-
-// Active-low reset button pin.
-#define RESET_BUTTON_PIN 17
-
-// GNSS UART Pins
-#define GNSS_TX       8
-#define GNSS_RX       9
-#define GNSS_UART     Serial2
-#define SERIAL_BUFFER_SIZE 2048
-#define NMEA_PASSTHROUGH 1
-#define CORE1_SERIAL_LOG 1
 static constexpr uint32_t GNSS_TARGET_BAUD = 115200;
-#if defined(USE_TINYUSB)
-#ifndef USB_DEVICE_MANUFACTURER_NAME
-#define USB_DEVICE_MANUFACTURER_NAME "CoD_Segfault"
-#endif
-#ifndef USB_DEVICE_PRODUCT_NAME
-#define USB_DEVICE_PRODUCT_NAME "WiFi Shuriken"
-#endif
-#ifndef USB_DEVICE_SERIAL_OVERRIDE
-#define USB_DEVICE_SERIAL_OVERRIDE ""
-#endif
-#ifndef USB_CDC0_IFACE_NAME
-#define USB_CDC0_IFACE_NAME "Console"
-#endif
-#ifndef USB_CDC1_IFACE_NAME
-#define USB_CDC1_IFACE_NAME "NMEA"
-#endif
-#endif
 
 SdFat sd;
 FsFile logFile;
@@ -210,9 +136,6 @@ static void updateGpsFixLed(bool usable_fix) {
 static constexpr size_t ESP_FRAME_SIZE = SPI_FRAME_SIZE;
 static constexpr uint32_t ESP_SPI_HZ = 20000000;
 static constexpr size_t ESP_FRAME_TAG_INDEX = SPI_FRAME_TAG_INDEX;
-#ifndef ESP_INTERFRAME_US
-#define ESP_INTERFRAME_US 100
-#endif
 static constexpr int ESP_SCAN_RESPONSE_PULLS = 24;
 static constexpr int ESP_RESULT_RESPONSE_PULLS = 32;
 static constexpr int ESP_SCAN_CMD_RETRIES = 3;
@@ -833,6 +756,16 @@ void loop2() {
 }
 
 void setup() {
+  // Bring up status LED first so bare-board bring-up has immediate feedback.
+#if RGB_POWER_ENABLED
+  pinMode(RGB_POWER_PIN, OUTPUT);
+  digitalWrite(RGB_POWER_PIN, HIGH);
+  delay(10);  // Let WS2812 power rail settle before first data frame.
+#endif
+  pixels.begin();
+  pixels.setPixelColor(0, pixels.Color(128, 0, 0));
+  pixels.show();
+
 #if defined(USE_TINYUSB)
   TinyUSBDevice.setManufacturerDescriptor(USB_DEVICE_MANUFACTURER_NAME);
   TinyUSBDevice.setProductDescriptor(USB_DEVICE_PRODUCT_NAME);
@@ -852,6 +785,8 @@ void setup() {
   delay(2000);
 
   Serial.println("WiFi Shuriken Startup");
+  Serial.printf("RGB config: data=%d power_en=%d power_pin=%d\n",
+                RGB_PIN, RGB_POWER_ENABLED, RGB_POWER_PIN);
   logging.initUtcTimezone();
 #if defined(USE_TINYUSB)
   Serial.printf("USB CDC IDs: CDC0='%s' CDC1='%s'\n",
@@ -860,6 +795,7 @@ void setup() {
   logging.registerSdDateTimeCallback();
   pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
   Serial.println("Reset button enabled on GPIO17");
+
 
   // Setup SD Card on SPI0
   SPI.setSCK(SD_PIN_SCK);
@@ -899,9 +835,7 @@ void setup() {
   Serial.println("SPI1 initialized.");
 #endif
 
-  // Initialize RGB LED
-  pixels.begin();
-  updateGpsFixLed(false);
+
 
   // Initialize GNSS UART
   GNSS_UART.setTX(GNSS_TX);
