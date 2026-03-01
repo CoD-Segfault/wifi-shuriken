@@ -14,7 +14,7 @@
 #include <sys/time.h>
 #include <stdlib.h>
 #include <stdarg.h>
-#include "pico_master_logging.h"
+#include "pico_logging.h"
 #include "spi_protocol_shared.h"
 #include "wifi_dedupe.h"
 #include "wifi_result_utils.h"
@@ -42,21 +42,21 @@ static queue_t serial_msg_queue;
 static uint32_t scan_queue_drops = 0;
 static uint32_t serial_msg_drops = 0;
 static uint32_t dedupe_drops = 0;
-static constexpr uint32_t GPS_FIELD_MAX_AGE_MS = 3000;
+static constexpr uint16_t GPS_FIELD_MAX_AGE_MS = 3000;
 
 static constexpr uint16_t MASTER_DEDUPE_CAPACITY = WIFI_DEDUPE_TABLE_CAPACITY;
 static WiFiDedupeHash master_dedupe_storage[MASTER_DEDUPE_CAPACITY];
 static WiFiDedupeTable master_dedupe_table = {};
-static constexpr int SD_INIT_MAX_ATTEMPTS = 5;
-static constexpr uint32_t SD_INIT_RETRY_DELAY_MS = 500;
-static constexpr uint32_t SD_RETRY_BACKGROUND_MS = 30000;
+static constexpr uint8_t SD_INIT_MAX_ATTEMPTS = 5;
+static constexpr uint16_t SD_INIT_RETRY_DELAY_MS = 500;
+static constexpr uint16_t SD_RETRY_BACKGROUND_MS = 30000;
 static constexpr uint32_t SD_SPI_CLOCKS_HZ[] = {SD_SPI_CLOCK, 4000000, 1000000, 400000};
-static constexpr uint32_t GNSS_BOOT_TIMESTAMP_WAIT_MS = 6000;
+static constexpr uint16_t GNSS_BOOT_TIMESTAMP_WAIT_MS = 6000;
 static constexpr uint8_t GNSS_BOOT_TIMESTAMP_READS = 5;
-static constexpr uint32_t RESET_BUTTON_DEBOUNCE_MS = 50;
-static constexpr uint32_t WIGLE_TIME_WAIT_RETRY_MS = 1000;
-static constexpr uint32_t WIGLE_FLUSH_INTERVAL_MS = 5000;
-static constexpr uint16_t GNSS_MIN_VALID_YEAR = 2000;
+static constexpr uint8_t RESET_BUTTON_DEBOUNCE_MS = 50;
+static constexpr uint16_t CSV_LOG_TIME_WAIT_RETRY_MS = 1000;
+static constexpr uint16_t CSV_LOG_FLUSH_INTERVAL_MS = 5000;
+static constexpr uint16_t GNSS_MIN_VALID_YEAR = 2026;
 
 static pico_logging::State logging_state = {};
 static const pico_logging::Config logging_config = {
@@ -68,8 +68,8 @@ static const pico_logging::Config logging_config = {
   GNSS_BOOT_TIMESTAMP_WAIT_MS,
   GNSS_BOOT_TIMESTAMP_READS,
   GPS_FIELD_MAX_AGE_MS,
-  WIGLE_TIME_WAIT_RETRY_MS,
-  WIGLE_FLUSH_INTERVAL_MS,
+  CSV_LOG_TIME_WAIT_RETRY_MS,
+  CSV_LOG_FLUSH_INTERVAL_MS,
   GNSS_MIN_VALID_YEAR
 };
 static pico_logging::Logger logging(sd, logFile, gps, GNSS_UART, Serial, logging_config, logging_state);
@@ -132,19 +132,24 @@ static void updateGpsFixLed(bool usable_fix) {
   pixels.show();
 }
 
-// ---------- ESP32 SPI transport ----------
-static constexpr size_t ESP_FRAME_SIZE = SPI_FRAME_SIZE;
-static constexpr uint32_t ESP_SPI_HZ = 20000000;
-static constexpr size_t ESP_FRAME_TAG_INDEX = SPI_FRAME_TAG_INDEX;
-static constexpr int ESP_SCAN_RESPONSE_PULLS = 24;
-static constexpr int ESP_RESULT_RESPONSE_PULLS = 32;
-static constexpr int ESP_SCAN_CMD_RETRIES = 3;
-static constexpr int ESP_QUERY_CMD_RETRIES = 2;
-static constexpr int8_t ESP_STATUS_BUSY = -1;
-static constexpr int8_t ESP_STATUS_INVALID = -2;
-static constexpr int8_t ESP_STATUS_START_FAILED = -3;
-static constexpr int8_t ESP_STATUS_TRANSPORT_TIMEOUT = -4;
-static constexpr uint32_t SCANNER_SLOT_REPROBE_MS = 2000;
+// ---------- Scanner SPI transport ----------
+static constexpr size_t SCANNER_FRAME_SIZE = SPI_FRAME_SIZE;
+static constexpr uint32_t SCANNER_SPI_HZ = 20000000;
+static constexpr size_t SCANNER_FRAME_TAG_INDEX = SPI_FRAME_TAG_INDEX;
+static constexpr uint8_t SCANNER_SCAN_RESPONSE_PULLS = 24;
+static constexpr uint8_t SCANNER_RESULT_RESPONSE_PULLS = 32;
+static constexpr uint8_t SCANNER_SCAN_CMD_RETRIES = 3;
+static constexpr uint8_t SCANNER_QUERY_CMD_RETRIES = 2;
+// Scanner transport hardware config (mapped from legacy config macro names).
+static constexpr int SCANNER_PIN_SCK = ESP_PIN_SCK;
+static constexpr int SCANNER_PIN_MOSI = ESP_PIN_MOSI;
+static constexpr int SCANNER_PIN_MISO = ESP_PIN_MISO;
+static constexpr int SCANNER_PIN_CS = ESP_PIN_CS;
+static constexpr uint32_t SCANNER_INTERFRAME_US = ESP_INTERFRAME_US;
+static constexpr uint8_t SCANNER_DEVICE_TYPE = SCANNER_TYPE_ESP32_C5;
+// Local transport status (not on-wire protocol).
+static constexpr int8_t SCANNER_STATUS_TRANSPORT_TIMEOUT = -4;
+static constexpr uint16_t SCANNER_SLOT_REPROBE_MS = 2000;
 static constexpr uint8_t SCANNER_SLOT_TIMEOUT_REPROBE_THRESHOLD = 8;
 #if SCANNER_USE_SHIFTREG_CS
 static constexpr uint8_t SCANNER_SLOT_COUNT = SCANNER_SHIFTREG_OUTPUTS;
@@ -172,10 +177,7 @@ static const uint8_t CHANNELS_24G[] = {
 };
 
 static const uint8_t CHANNELS_5G[] = {
-  36, 40, 44, 48,
-  52, 56, 60, 64,
-  100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144,
-  149, 153, 157, 161, 165
+  36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165
 };
 
 // band_index: 0=2.4GHz list, 1=5GHz list.
@@ -204,41 +206,37 @@ static inline void scannerSetActiveSlot(uint8_t slot) {
 #endif
 }
 
-static inline uint8_t scannerGetActiveSlot() {
-  return scanner_active_slot;
+#if SCANNER_USE_SHIFTREG_CS
+static inline void scannerShiftRegWriteCsState(uint8_t state, bool force) {
+  if (!force && scanner_cs_shiftreg_state == state) {
+    return;
+  }
+  scanner_cs_shiftreg_state = state;
+  SPI1.beginTransaction(SPISettings(SCANNER_SHIFTREG_SPI_HZ, MSBFIRST, SPI_MODE0));
+  SPI1.transfer(scanner_cs_shiftreg_state);
+  SPI1.endTransaction();
+  digitalWrite(SCANNER_SHIFTREG_LATCH_PIN, HIGH);
+  digitalWrite(SCANNER_SHIFTREG_LATCH_PIN, LOW);
 }
-
-static inline bool scannerTypeSupported(uint8_t scanner_type) {
-  return scanner_type == SCANNER_TYPE_ESP32_C5;
-}
-
-static void noteSweepWrap(bool wrapped) {
-  if (!wrapped) return;
-  serialPrintlnTry("Completed full 2.4G + 5G sweep");
-}
+#endif
 
 static inline void advanceSweepChannelAndLog(size_t& band_index, size_t& channel_index) {
-  noteSweepWrap(advanceSweepChannel(band_index, channel_index));
+  if (advanceSweepChannel(band_index, channel_index)) {
+    serialPrintlnTry("Completed full 2.4G + 5G sweep");
+  }
 }
 
-static void espTransferFrame(const uint8_t* tx, uint8_t* rx) {
+static void scannerTransferFrame(const uint8_t* tx, uint8_t* rx) {
 #if SCANNER_USE_SHIFTREG_CS
   // Active-low CS via shift-register output slot.
-  const uint8_t assert_state = (uint8_t)(0xFFu & ~(1u << scannerGetActiveSlot()));
-  if (scanner_cs_shiftreg_state != assert_state) {
-    scanner_cs_shiftreg_state = assert_state;
-    SPI1.beginTransaction(SPISettings(SCANNER_SHIFTREG_SPI_HZ, MSBFIRST, SPI_MODE0));
-    SPI1.transfer(scanner_cs_shiftreg_state);
-    SPI1.endTransaction();
-    digitalWrite(SCANNER_SHIFTREG_LATCH_PIN, HIGH);
-    digitalWrite(SCANNER_SHIFTREG_LATCH_PIN, LOW);
-  }
+  const uint8_t assert_state = (uint8_t)(0xFFu & ~(1u << scanner_active_slot));
+  scannerShiftRegWriteCsState(assert_state, false);
 #else
-  digitalWrite(ESP_PIN_CS, LOW);
+  digitalWrite(SCANNER_PIN_CS, LOW);
 #endif
-  SPI1.beginTransaction(SPISettings(ESP_SPI_HZ, MSBFIRST, SPI_MODE0));
+  SPI1.beginTransaction(SPISettings(SCANNER_SPI_HZ, MSBFIRST, SPI_MODE0));
 
-  for (size_t i = 0; i < ESP_FRAME_SIZE; i++) {
+  for (size_t i = 0; i < SCANNER_FRAME_SIZE; i++) {
     const uint8_t t = tx ? tx[i] : 0;
     const uint8_t r = SPI1.transfer(t);
     if (rx) {
@@ -250,57 +248,50 @@ static void espTransferFrame(const uint8_t* tx, uint8_t* rx) {
 #if SCANNER_USE_SHIFTREG_CS
   // Deassert all scanner CS outputs.
   const uint8_t deassert_state = 0xFFu;
-  if (scanner_cs_shiftreg_state != deassert_state) {
-    scanner_cs_shiftreg_state = deassert_state;
-    SPI1.beginTransaction(SPISettings(SCANNER_SHIFTREG_SPI_HZ, MSBFIRST, SPI_MODE0));
-    SPI1.transfer(scanner_cs_shiftreg_state);
-    SPI1.endTransaction();
-    digitalWrite(SCANNER_SHIFTREG_LATCH_PIN, HIGH);
-    digitalWrite(SCANNER_SHIFTREG_LATCH_PIN, LOW);
-  }
+  scannerShiftRegWriteCsState(deassert_state, false);
 #else
-  digitalWrite(ESP_PIN_CS, HIGH);
+  digitalWrite(SCANNER_PIN_CS, HIGH);
 #endif
 }
 
-static inline void espInterframeWait() {
-#if ESP_INTERFRAME_US > 0
-  delayMicroseconds(ESP_INTERFRAME_US);
-#endif
+static inline void scannerInterframeWait() {
+  if (SCANNER_INTERFRAME_US > 0) {
+    delayMicroseconds(SCANNER_INTERFRAME_US);
+  }
 }
 
 // Issue command frame, then pull NOP frames until response tag matches expected cmd.
-static bool espCommandWithResponse(const uint8_t* cmd_frame,
+static bool scannerCommandWithResponse(const uint8_t* cmd_frame,
                                    uint8_t expected_cmd_tag,
                                    uint8_t* response_frame,
                                    int max_pulls = 8) {
-  uint8_t rx[ESP_FRAME_SIZE] = {0};
-  uint8_t nop[ESP_FRAME_SIZE] = {0};
+  uint8_t rx[SCANNER_FRAME_SIZE] = {0};
+  uint8_t nop[SCANNER_FRAME_SIZE] = {0};
   nop[0] = CMD_NOP;
-  espTransferFrame(cmd_frame, rx);
-  espInterframeWait();
+  scannerTransferFrame(cmd_frame, rx);
+  scannerInterframeWait();
 
   for (int i = 0; i < max_pulls; i++) {
-    espTransferFrame(nop, response_frame);
-    if (response_frame[ESP_FRAME_TAG_INDEX] == expected_cmd_tag) {
+    scannerTransferFrame(nop, response_frame);
+    if (response_frame[SCANNER_FRAME_TAG_INDEX] == expected_cmd_tag) {
       return true;
     }
-    espInterframeWait();
+    scannerInterframeWait();
   }
   return false;
 }
 
-static void espDrainStaleFrames(int pulls = 4) {
-  uint8_t nop[ESP_FRAME_SIZE] = {0};
-  uint8_t rx[ESP_FRAME_SIZE] = {0};
+static void scannerDrainStaleFrames(int pulls = 4) {
+  uint8_t nop[SCANNER_FRAME_SIZE] = {0};
+  uint8_t rx[SCANNER_FRAME_SIZE] = {0};
   nop[0] = CMD_NOP;
   for (int i = 0; i < pulls; i++) {
-    espTransferFrame(nop, rx);
-    espInterframeWait();
+    scannerTransferFrame(nop, rx);
+    scannerInterframeWait();
   }
 }
 
-static void espInitBus() {
+static void scannerInitBus() {
 #if SCANNER_USE_SHIFTREG_CS
   pinMode(SCANNER_SHIFTREG_LATCH_PIN, OUTPUT);
   pinMode(SCANNER_SHIFTREG_OE_PIN, OUTPUT);
@@ -308,33 +299,28 @@ static void espInitBus() {
   // Active-low OE: disable outputs while shift register state is initialized.
   digitalWrite(SCANNER_SHIFTREG_OE_PIN, HIGH);
 #else
-  digitalWrite(ESP_PIN_CS, HIGH);
-  pinMode(ESP_PIN_CS, OUTPUT);
+  digitalWrite(SCANNER_PIN_CS, HIGH);
+  pinMode(SCANNER_PIN_CS, OUTPUT);
 #endif
-  SPI1.setSCK(ESP_PIN_SCK);
-  SPI1.setTX(ESP_PIN_MOSI);
-  SPI1.setRX(ESP_PIN_MISO);
+  SPI1.setSCK(SCANNER_PIN_SCK);
+  SPI1.setTX(SCANNER_PIN_MOSI);
+  SPI1.setRX(SCANNER_PIN_MISO);
   SPI1.begin();
 #if SCANNER_USE_SHIFTREG_CS
   scannerSetActiveSlot(SCANNER_INITIAL_SLOT);
-  scanner_cs_shiftreg_state = 0xFFu;
-  SPI1.beginTransaction(SPISettings(SCANNER_SHIFTREG_SPI_HZ, MSBFIRST, SPI_MODE0));
-  SPI1.transfer(scanner_cs_shiftreg_state);
-  SPI1.endTransaction();
-  digitalWrite(SCANNER_SHIFTREG_LATCH_PIN, HIGH);
-  digitalWrite(SCANNER_SHIFTREG_LATCH_PIN, LOW);
+  scannerShiftRegWriteCsState(0xFFu, true);
   // Enable outputs once all scanner CS lines are safely deasserted.
   digitalWrite(SCANNER_SHIFTREG_OE_PIN, LOW);
 #endif
 }
 
-static bool espGetDeviceId(DeviceIdReply& out) {
-  uint8_t tx[ESP_FRAME_SIZE] = {0};
-  uint8_t rx[ESP_FRAME_SIZE] = {0};
+static bool scannerGetDeviceId(DeviceIdReply& out) {
+  uint8_t tx[SCANNER_FRAME_SIZE] = {0};
+  uint8_t rx[SCANNER_FRAME_SIZE] = {0};
 
   for (int attempt = 0; attempt < 8; attempt++) {
     tx[0] = CMD_ID;
-    if (espCommandWithResponse(tx, CMD_ID, rx, 10)) {
+    if (scannerCommandWithResponse(tx, CMD_ID, rx, 10)) {
       memcpy(&out, rx, sizeof(out));
       if (out.proto_version == PROTO_VERSION) {
         return true;
@@ -356,7 +342,7 @@ static bool ensureScannerSlotIdentity(uint8_t slot, ScannerSlotState& state) {
   }
 
   DeviceIdReply id = {};
-  if (!espGetDeviceId(id)) {
+  if (!scannerGetDeviceId(id)) {
     state.id_valid = false;
     state.transport_timeouts = 0;
     state.next_probe_ms = now + SCANNER_SLOT_REPROBE_MS;
@@ -372,7 +358,7 @@ static bool ensureScannerSlotIdentity(uint8_t slot, ScannerSlotState& state) {
   state.miss_logged = false;
 
   const bool proto_ok = (id.proto_version == PROTO_VERSION);
-  const bool type_ok = scannerTypeSupported(id.scanner_type);
+  const bool type_ok = (id.scanner_type == SCANNER_DEVICE_TYPE);
   const bool max_ok = (id.max_results > 0 && id.max_results <= PROTO_MAX_RESULTS);
   if (!(proto_ok && type_ok && max_ok)) {
     state.id_valid = false;
@@ -394,23 +380,26 @@ static bool ensureScannerSlotIdentity(uint8_t slot, ScannerSlotState& state) {
   serialPrintfTry("S%u scanner ready: proto=%u type=%u caps=0x%02X max=%u\n",
                   (unsigned)slot,
                   id.proto_version, id.scanner_type, id.capabilities, id.max_results);
-  espDrainStaleFrames(1);
+  scannerDrainStaleFrames(1);
   return true;
 }
 
-static int8_t espStartScan(uint8_t band, uint8_t channel) {
-  for (int attempt = 0; attempt < ESP_SCAN_CMD_RETRIES; attempt++) {
-    uint8_t tx[ESP_FRAME_SIZE] = {0};
-    uint8_t rx[ESP_FRAME_SIZE] = {0};
-    tx[0] = CMD_SCAN;
-    tx[1] = band;
-    tx[2] = channel;
-    if (espCommandWithResponse(tx, CMD_SCAN, rx, ESP_SCAN_RESPONSE_PULLS)) {
+static int8_t scannerQueryStatusWithRetry(uint8_t cmd,
+                                          uint8_t arg1,
+                                          uint8_t arg2,
+                                          uint8_t response_pulls,
+                                          uint8_t retries,
+                                          int8_t min_valid_status,
+                                          int8_t max_valid_status) {
+  for (uint8_t attempt = 0; attempt < retries; attempt++) {
+    uint8_t tx[SCANNER_FRAME_SIZE] = {0};
+    uint8_t rx[SCANNER_FRAME_SIZE] = {0};
+    tx[0] = cmd;
+    tx[1] = arg1;
+    tx[2] = arg2;
+    if (scannerCommandWithResponse(tx, cmd, rx, response_pulls)) {
       const int8_t status = (int8_t)rx[0];
-      if (status == 0 ||
-          status == ESP_STATUS_BUSY ||
-          status == ESP_STATUS_INVALID ||
-          status == ESP_STATUS_START_FAILED) {
+      if (status >= min_valid_status && status <= max_valid_status) {
         return status;
       }
       // Corrupt/unknown status payload; retry in-place before giving up.
@@ -418,42 +407,24 @@ static int8_t espStartScan(uint8_t band, uint8_t channel) {
     }
     // Lost/misaligned response; retry in-place before giving up.
   }
-  return -4; // transport timeout waiting for scan response
+  return SCANNER_STATUS_TRANSPORT_TIMEOUT;
 }
 
-static int8_t espGetResultCount() {
-  for (int attempt = 0; attempt < ESP_QUERY_CMD_RETRIES; attempt++) {
-    uint8_t tx[ESP_FRAME_SIZE] = {0};
-    uint8_t rx[ESP_FRAME_SIZE] = {0};
-    tx[0] = CMD_RESULT_COUNT;
-    if (espCommandWithResponse(tx, CMD_RESULT_COUNT, rx, ESP_RESULT_RESPONSE_PULLS)) {
-      const int8_t count = (int8_t)rx[0];
-      if (count == ESP_STATUS_BUSY || count >= 0) {
-        return count;
-      }
-      // Corrupt/unknown count payload; retry in-place before timeout.
-      continue;
-    }
-    // Lost/misaligned response; retry in-place before timeout.
-  }
-  return ESP_STATUS_TRANSPORT_TIMEOUT;
-}
-
-static bool espGetResult(WiFiResultPacket& pkt) {
-  uint8_t tx[ESP_FRAME_SIZE] = {0};
-  uint8_t rx[ESP_FRAME_SIZE] = {0};
-  uint8_t nop[ESP_FRAME_SIZE] = {0};
+static bool scannerGetResult(WiFiResultPacket& pkt) {
+  uint8_t tx[SCANNER_FRAME_SIZE] = {0};
+  uint8_t rx[SCANNER_FRAME_SIZE] = {0};
+  uint8_t nop[SCANNER_FRAME_SIZE] = {0};
   tx[0] = CMD_RESULT_GET;
   nop[0] = CMD_NOP;
 
-  for (int attempt = 0; attempt < ESP_QUERY_CMD_RETRIES; attempt++) {
-    espTransferFrame(tx, rx);
-    espInterframeWait();
+  for (int attempt = 0; attempt < SCANNER_QUERY_CMD_RETRIES; attempt++) {
+    scannerTransferFrame(tx, rx);
+    scannerInterframeWait();
 
-    for (int pull = 0; pull < ESP_RESULT_RESPONSE_PULLS; pull++) {
-      espTransferFrame(nop, rx);
-      if (rx[ESP_FRAME_TAG_INDEX] != CMD_RESULT_GET) {
-        espInterframeWait();
+    for (int pull = 0; pull < SCANNER_RESULT_RESPONSE_PULLS; pull++) {
+      scannerTransferFrame(nop, rx);
+      if (rx[SCANNER_FRAME_TAG_INDEX] != CMD_RESULT_GET) {
+        scannerInterframeWait();
         continue;
       }
 
@@ -467,7 +438,7 @@ static bool espGetResult(WiFiResultPacket& pkt) {
       }
 
       // Valid tag but invalid payload; keep pulling to find a sane packet.
-      espInterframeWait();
+      scannerInterframeWait();
     }
 
     // Retry full RESULT_GET transaction before failing this record.
@@ -555,14 +526,20 @@ static void startScanForCurrentChannel(uint8_t slot,
     ? CHANNELS_24G[channel_index]
     : CHANNELS_5G[channel_index];
 
-  const int8_t status = espStartScan(band, channel);
-  if (status == 0) {
+  const int8_t status = scannerQueryStatusWithRetry(CMD_SCAN,
+                                                    band,
+                                                    channel,
+                                                    SCANNER_SCAN_RESPONSE_PULLS,
+                                                    SCANNER_SCAN_CMD_RETRIES,
+                                                    SCANNER_STATUS_START_FAILED,
+                                                    SCANNER_STATUS_OK);
+  if (status == SCANNER_STATUS_OK) {
     serialPrintfTry("S%u Scan started (band=%u ch=%u)\n",
                     (unsigned)slot, band, channel);
     advanceSweepChannelAndLog(band_index, channel_index);
     return;
   }
-  if (status == ESP_STATUS_BUSY) {
+  if (status == SCANNER_STATUS_BUSY) {
     // If RESULT_COUNT said idle but SCAN says busy, the prior start likely latched
     // and we missed/garbled the ACK. Advance to avoid re-requesting same channel.
     serialPrintfTry("S%u Scan already active (band=%u ch=%u); assuming prior start latched\n",
@@ -570,10 +547,16 @@ static void startScanForCurrentChannel(uint8_t slot,
     advanceSweepChannelAndLog(band_index, channel_index);
     return;
   }
-  if (status == ESP_STATUS_TRANSPORT_TIMEOUT) {
+  if (status == SCANNER_STATUS_TRANSPORT_TIMEOUT) {
     // If SCAN ACK was lost but scanner is now busy, treat scan as started.
-    const int8_t c = espGetResultCount();
-    if (c == ESP_STATUS_BUSY) {
+    const int8_t c = scannerQueryStatusWithRetry(CMD_RESULT_COUNT,
+                                                 0,
+                                                 0,
+                                                 SCANNER_RESULT_RESPONSE_PULLS,
+                                                 SCANNER_QUERY_CMD_RETRIES,
+                                                 SCANNER_STATUS_BUSY,
+                                                 static_cast<int8_t>(PROTO_MAX_RESULTS));
+    if (c == SCANNER_STATUS_BUSY) {
       serialPrintfTry("S%u Scan started (band=%u ch=%u) via BUSY confirm\n",
                       (unsigned)slot, band, channel);
       advanceSweepChannelAndLog(band_index, channel_index);
@@ -592,7 +575,7 @@ static void startScanForCurrentChannel(uint8_t slot,
   advanceSweepChannelAndLog(band_index, channel_index);
 }
 
-// Stateless scan pump per slot:
+// Per-slot scan pump:
 // 1) Poll RESULT_COUNT.
 // 2) If busy -> return.
 // 3) If zero -> request scan on current channel.
@@ -602,15 +585,21 @@ static void processScannerSlot(uint8_t slot,
                                size_t& band_index,
                                size_t& channel_index) {
   scannerSetActiveSlot(slot);
-  const int8_t count = espGetResultCount();
+  const int8_t count = scannerQueryStatusWithRetry(CMD_RESULT_COUNT,
+                                                   0,
+                                                   0,
+                                                   SCANNER_RESULT_RESPONSE_PULLS,
+                                                   SCANNER_QUERY_CMD_RETRIES,
+                                                   SCANNER_STATUS_BUSY,
+                                                   static_cast<int8_t>(PROTO_MAX_RESULTS));
 
   // Active scan on slave; poll this slot again next round.
-  if (count == ESP_STATUS_BUSY) {
+  if (count == SCANNER_STATUS_BUSY) {
     slot_state.transport_timeouts = 0;
     return;
   }
 
-  if (count == ESP_STATUS_TRANSPORT_TIMEOUT) {
+  if (count == SCANNER_STATUS_TRANSPORT_TIMEOUT) {
     if (slot_state.transport_timeouts < 0xFF) {
       slot_state.transport_timeouts++;
     }
@@ -618,7 +607,7 @@ static void processScannerSlot(uint8_t slot,
       serialPrintfTry("S%u RESULT_COUNT timeout x%u; draining and continuing\n",
                       (unsigned)slot, (unsigned)slot_state.transport_timeouts);
       slot_state.transport_timeouts = 0;
-      espDrainStaleFrames(4);
+      scannerDrainStaleFrames(4);
     }
     return;
   }
@@ -644,7 +633,7 @@ static void processScannerSlot(uint8_t slot,
   uint16_t batch_dedupe_logs = 0;
   for (int i = 0; i < count; i++) {
     WiFiResultPacket pkt = {};
-    if (!espGetResult(pkt)) {
+    if (!scannerGetResult(pkt)) {
       break;
     }
 
@@ -708,7 +697,7 @@ static void processScannerSlot(uint8_t slot,
 
     serialPrintfTry("S%u Unknown result type: 0x%02X; draining stale frames\n",
                     (unsigned)slot, pkt.result_type);
-    espDrainStaleFrames(2);
+    scannerDrainStaleFrames(2);
     break;
   }
 
@@ -726,6 +715,41 @@ static void processScannerSlot(uint8_t slot,
   }
 }
 
+static void serialPrintRuntimeStatus() {
+  Serial.printf("Queue drops=%lu serial_drop=%lu dedupe_drop=%lu logged=%lu blank_gps=%lu\n",
+                (unsigned long)scan_queue_drops,
+                (unsigned long)serial_msg_drops,
+                (unsigned long)dedupe_drops,
+                (unsigned long)logging_state.csv_rows,
+                (unsigned long)logging_state.csv_rows_blank_gps);
+}
+
+static void serialPrintGpsStatus(bool usable_fix) {
+  Serial.printf("GPS: usable=%s loc_valid=%s updated=%s lat=%.7f lon=%.7f hdop=%.2f sats=%u age=%lu chars=%lu fix=%lu cksum_fail=%lu\n",
+                usable_fix ? "YES" : "NO",
+                gps.location.isValid() ? "YES" : "NO",
+                gps.location.isUpdated() ? "YES" : "NO",
+                gps.location.isValid() ? gps.location.lat() : 0.0,
+                gps.location.isValid() ? gps.location.lng() : 0.0,
+                gps.hdop.isValid() ? gps.hdop.hdop() : 0.0,
+                gps.satellites.isValid() ? gps.satellites.value() : 0,
+                (unsigned long)gps.location.age(),
+                (unsigned long)gps.charsProcessed(),
+                (unsigned long)gps.sentencesWithFix(),
+                (unsigned long)gps.failedChecksum());
+}
+
+static void printPeriodicStatus(bool usable_fix) {
+  static uint32_t lastStatMs = 0;
+  const uint32_t now = millis();
+  if ((now - lastStatMs) <= 10000) {
+    return;
+  }
+  lastStatMs = now;
+  serialPrintRuntimeStatus();
+  serialPrintGpsStatus(usable_fix);
+}
+
 void loop2() {
   static ScannerSlotState slot_state[SCANNER_SLOT_COUNT] = {};
   static size_t band_index[SCANNER_SLOT_COUNT] = {};
@@ -736,11 +760,11 @@ void loop2() {
 #if SCANNER_USE_SHIFTREG_CS
   for (uint8_t s = 0; s < SCANNER_SLOT_COUNT; s++) {
     scannerSetActiveSlot(s);
-    espDrainStaleFrames(1);
+    scannerDrainStaleFrames(1);
   }
   scannerSetActiveSlot(slot);
 #else
-  espDrainStaleFrames();
+  scannerDrainStaleFrames();
 #endif
 
   while (true) {
@@ -795,8 +819,6 @@ void setup() {
   logging.registerSdDateTimeCallback();
   pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
   Serial.println("Reset button enabled on GPIO17");
-
-
   // Setup SD Card on SPI0
   SPI.setSCK(SD_PIN_SCK);
   SPI.setTX(SD_PIN_MOSI);
@@ -824,9 +846,9 @@ void setup() {
   queue_init(&serial_msg_queue, sizeof(QueuedSerialMsg), 64);
   wifiDedupeTableInit(&master_dedupe_table, master_dedupe_storage, MASTER_DEDUPE_CAPACITY);
   wifiDedupeTableReset(&master_dedupe_table);
-  
-  // Initialize SPI1 for ESP32 communication
-  espInitBus();
+
+  // Initialize SPI1 for scanner communication
+  scannerInitBus();
 
 #if SCANNER_USE_SHIFTREG_CS
   Serial.printf("SPI1 initialized (shift-register scanner CS enabled, slots=%u).\n",
@@ -834,9 +856,6 @@ void setup() {
 #else
   Serial.println("SPI1 initialized.");
 #endif
-
-
-
   // Initialize GNSS UART
   GNSS_UART.setTX(GNSS_TX);
   GNSS_UART.setRX(GNSS_RX);
@@ -851,25 +870,25 @@ void setup() {
 
   if (logging_state.sd_ready) {
     if (!logging.ensureBootTimestampFromClock()) {
-      Serial.println("Waiting for valid GNSS time before creating WiGLE log file");
-      logging_state.sd_next_retry_ms = millis() + WIGLE_TIME_WAIT_RETRY_MS;
-    } else if (!logging.selectWigleLogPath()) {
-      Serial.println("WiGLE path selection failed");
+      Serial.println("Waiting for valid GNSS time before creating CSV log file");
+      logging_state.sd_next_retry_ms = millis() + CSV_LOG_TIME_WAIT_RETRY_MS;
+    } else if (!logging.selectCsvLogPath()) {
+      Serial.println("CSV log path selection failed");
       logging_state.sd_next_retry_ms = millis() + SD_RETRY_BACKGROUND_MS;
     } else {
-      logging_state.wigle_ready = logging.initWigleCsv(logging_state.wigle_log_path);
-      if (logging_state.wigle_ready) {
-        Serial.print("WiGLE CSV ready: ");
-        Serial.println(logging_state.wigle_log_path);
+      logging_state.csv_ready = logging.initCsvLog(logging_state.csv_log_path);
+      if (logging_state.csv_ready) {
+        Serial.print("CSV log ready: ");
+        Serial.println(logging_state.csv_log_path);
       } else {
-        Serial.print("WiGLE CSV open failed: ");
-        Serial.println(logging_state.wigle_log_path);
+        Serial.print("CSV log open failed: ");
+        Serial.println(logging_state.csv_log_path);
         logging_state.sd_next_retry_ms = millis() + SD_RETRY_BACKGROUND_MS;
       }
     }
   }
 
-  // Set up second core loop for SPI communication with ESP32
+  // Set up second core loop for SPI communication with scanner
   multicore_launch_core1(loop2);
 
 }
@@ -908,36 +927,15 @@ void loop() {
   // Limit per-iteration SD writes so GNSS parsing is serviced frequently.
   int drained = 0;
   while (drained < 16 && queue_try_remove(&scan_result_queue, &q)) {
-    logging.appendWigleRow(q);
+    logging.appendCsvRow(q);
     drained++;
   }
   // Time-based flush closes the durability gap between row-count flushes.
-  logging.flushWigleIfDue();
+  logging.flushCsvIfDue();
 
-  if (!logging_state.wigle_ready) {
+  if (!logging_state.csv_ready) {
     logging.tryRecoverSdLogging();
   }
 
-  static uint32_t lastStatMs = 0;
-  if (millis() - lastStatMs > 10000) {
-    lastStatMs = millis();
-    Serial.printf("Queue drops=%lu serial_drop=%lu dedupe_drop=%lu logged=%lu blank_gps=%lu\n",
-                  (unsigned long)scan_queue_drops,
-                  (unsigned long)serial_msg_drops,
-                  (unsigned long)dedupe_drops,
-                  (unsigned long)logging_state.wigle_rows,
-                  (unsigned long)logging_state.wigle_rows_blank_gps);
-    Serial.printf("GPS: usable=%s loc_valid=%s updated=%s lat=%.7f lon=%.7f hdop=%.2f sats=%u age=%lu chars=%lu fix=%lu cksum_fail=%lu\n",
-                  usable_fix ? "YES" : "NO",
-                  gps.location.isValid() ? "YES" : "NO",
-                  gps.location.isUpdated() ? "YES" : "NO",
-                  gps.location.isValid() ? gps.location.lat() : 0.0,
-                  gps.location.isValid() ? gps.location.lng() : 0.0,
-                  gps.hdop.isValid() ? gps.hdop.hdop() : 0.0,
-                  gps.satellites.isValid() ? gps.satellites.value() : 0,
-                  (unsigned long)gps.location.age(),
-                  (unsigned long)gps.charsProcessed(),
-                  (unsigned long)gps.sentencesWithFix(),
-                  (unsigned long)gps.failedChecksum());
-  }
+  printPeriodicStatus(usable_fix);
 }

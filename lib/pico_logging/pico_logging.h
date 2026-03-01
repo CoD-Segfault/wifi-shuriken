@@ -7,6 +7,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "../pico_logging_format/pico_logging_format.h"
+
 namespace pico_logging {
 
 struct QueuedScanResult {
@@ -27,29 +29,25 @@ struct Config {
   uint32_t gnss_boot_timestamp_wait_ms;
   uint8_t gnss_boot_timestamp_reads;
   uint32_t gps_field_max_age_ms;
-  uint32_t wigle_time_wait_retry_ms;
-  uint32_t wigle_flush_interval_ms;
+  uint32_t csv_time_wait_retry_ms;
+  uint32_t csv_flush_interval_ms;
   uint16_t gnss_min_valid_year;
 };
 
 struct State {
   bool sd_ready = false;
-  bool wigle_ready = false;
-  bool wigle_dirty = false;
-  bool wigle_path_selected = false;
+  bool csv_ready = false;
+  bool csv_dirty = false;
+  bool csv_path_selected = false;
   bool master_clock_valid = false;
   uint32_t sd_next_retry_ms = 0;
   size_t sd_retry_clock_index = 0;
-  uint32_t wigle_last_flush_ms = 0;
-  uint32_t wigle_rows = 0;
-  uint32_t wigle_rows_blank_gps = 0;
-  char wigle_boot_timestamp[15] = "";
-  char wigle_log_path[40] = "";
+  uint32_t csv_last_flush_ms = 0;
+  uint32_t csv_rows = 0;
+  uint32_t csv_rows_blank_gps = 0;
+  char csv_boot_timestamp[15] = "";
+  char csv_log_path[40] = "";
 };
-
-void formatBssid(const uint8_t* bssid, char* out, size_t out_len);
-void wigleCsvEscape(const char* in, char* out, size_t out_len);
-void buildAndroidCapabilitiesString(uint16_t caps, char* out, size_t out_len);
 
 class Logger {
  public:
@@ -68,15 +66,15 @@ class Logger {
   bool ensureBootTimestampFromClock();
   void captureBootTimestampFromGnss();
 
-  bool selectWigleLogPath();
+  bool selectCsvLogPath();
   bool mountSdWithRetries(int max_attempts);
-  bool initWigleCsv(const char* path);
+  bool initCsvLog(const char* path);
 
   void disableSdLoggingAndScheduleRetry(const char* reason);
   void tryRecoverSdLogging();
 
-  void appendWigleRow(const QueuedScanResult& r);
-  void flushWigleIfDue();
+  void appendCsvRow(const QueuedScanResult& r);
+  void flushCsvIfDue();
 
  private:
   static Logger* date_time_callback_instance_;
@@ -101,4 +99,5 @@ class Logger {
 };
 
 }  // namespace pico_logging
+
 

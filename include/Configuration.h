@@ -24,7 +24,7 @@
 #define SD_MISO_PULLUP 1  // 1 enables internal pull-up on SD MISO.
 #endif
 
-// ESP32 scanner SPI1 pin mapping on the Pico master.
+// Scanner SPI1 pin mapping on the Pico master (legacy ESP_PIN_* macro names).
 #ifndef ESP_PIN_SCK
 #define ESP_PIN_SCK 10  // SPI1 clock line to scanner module.
 #endif

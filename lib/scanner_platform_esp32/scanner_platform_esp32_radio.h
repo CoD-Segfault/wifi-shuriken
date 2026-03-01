@@ -5,8 +5,8 @@
 #include "../../include/spi_protocol_shared.h"
 
 // Generic radio scan status contract used by scanner logic.
-static constexpr int SCANNER_RADIO_SCAN_RUNNING = -1;
-static constexpr int SCANNER_RADIO_SCAN_FAILED = -2;
+static constexpr int8_t SCANNER_RADIO_SCAN_RUNNING = -1;
+static constexpr int8_t SCANNER_RADIO_SCAN_FAILED = -2;
 
 bool scannerRadioInit();
 
@@ -23,4 +23,3 @@ void scannerRadioDeleteScanResults();
 
 // Reads scan result by index from backend snapshot.
 bool scannerRadioReadResult(int index, WiFiResult& out);
-

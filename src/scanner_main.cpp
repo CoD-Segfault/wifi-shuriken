@@ -58,18 +58,11 @@
 #endif
 
 // ---------- Scan tuning ----------
-static constexpr int ACTIVE_DWELL_MS  = 110;
-static constexpr int PASSIVE_DWELL_MS = 210;
+static constexpr uint16_t ACTIVE_DWELL_MS  = 110;
+static constexpr uint16_t PASSIVE_DWELL_MS = 210;
 static constexpr uint8_t BAND_5_GHZ = 5;
-static constexpr uint32_t SPI_RX_TIMEOUT_MS = 50;
+static constexpr uint16_t SPI_RX_TIMEOUT_MS = 50;
 static constexpr uint8_t SPI_TRANSACTION_QUEUE_SIZE = 4;
-
-enum ScanStatus : int8_t {
-  SCAN_STATUS_OK = 0,
-  SCAN_STATUS_BUSY = -1,
-  SCAN_STATUS_INVALID = -2,
-  SCAN_STATUS_START_FAILED = -3,
-};
 
 // ---------- Fixed SPI frame size ----------
 // Keep a fixed frame size for all transactions (simplifies master & DMA alignment).
@@ -81,17 +74,22 @@ static uint8_t tx_buf[FRAME_SIZE] __attribute__((aligned(4)));
 
 // ---------- Scan state ----------
 // Two-stage pipeline:
-// 1) Radio scan snapshot lifecycle (scan_active / scan_processing / scan_count / scan_index).
+// 1) Radio scan snapshot lifecycle (scan_phase / scan_count / scan_index).
 // 2) SPI-visible deduped buffer lifecycle (spi_results / spi_result_count / spi_result_index / spi_status).
-static bool scan_active = false;
-static bool scan_processing = false;
+enum class ScanPhase : uint8_t {
+  Idle = 0,
+  Scanning = 1,
+  Processing = 2,
+};
+
+static ScanPhase scan_phase = ScanPhase::Idle;
 static int scan_count = 0;     // total results in current scan snapshot
 static int scan_index = 0;     // next raw result index to process
 static WiFiResult spi_results[PROTO_MAX_RESULTS] = {};
 static uint8_t spi_result_count = 0;
 static uint8_t spi_result_index = 0;
 // Master-visible status: 0=idle, -1=busy (scan/processing), >0=buffered results available.
-static int8_t spi_status = SCAN_STATUS_OK;
+static int8_t spi_status = SCANNER_STATUS_OK;
 static uint8_t last_scan_band = 0;
 static uint8_t last_scan_channel = 0;
 static WiFiDedupeHash scan_dedupe_storage[WIFI_DEDUPE_TABLE_CAPACITY];
@@ -102,27 +100,15 @@ static uint32_t scan_dedupe_logs = 0;
 #endif
 
 // Optional: immediate status for CMD_SCAN response (returned next transaction)
-static int8_t last_scan_status = SCAN_STATUS_OK;
+static int8_t last_scan_status = SCANNER_STATUS_OK;
 
 // ---------- Helpers ----------
-static inline bool scannerStatusLedConfigured() {
-  return SCANNER_STATUS_LED_ENABLED && ((int)SCANNER_STATUS_LED_PIN >= 0);
-}
-
-static void scannerStatusLedWrite(bool on) {
-  if (!scannerStatusLedConfigured()) {
+static void scannerStatusLedSet(bool on) {
+  if (!SCANNER_STATUS_LED_ENABLED || ((int)SCANNER_STATUS_LED_PIN < 0)) {
     return;
   }
   const bool drive_high = SCANNER_STATUS_LED_ACTIVE_LOW ? !on : on;
   digitalWrite(SCANNER_STATUS_LED_PIN, drive_high ? HIGH : LOW);
-}
-
-static void scannerStatusLedInitBootOn() {
-  if (!scannerStatusLedConfigured()) {
-    return;
-  }
-  pinMode(SCANNER_STATUS_LED_PIN, OUTPUT);
-  scannerStatusLedWrite(true);
 }
 
 static const char* cmd_to_str(uint8_t cmd) {
@@ -149,7 +135,6 @@ static void clear_scan_results() {
   }
   scan_count = 0;
   scan_index = 0;
-  scan_processing = false;
 #if LOG_DEDUPE_HITS
   scan_dedupe_hits = 0;
   scan_dedupe_logs = 0;
@@ -159,6 +144,23 @@ static void clear_scan_results() {
 static void clear_spi_result_buffer() {
   spi_result_count = 0;
   spi_result_index = 0;
+}
+
+static inline void setResultBufferIdle() {
+  spi_status = SCANNER_STATUS_OK;
+  clear_spi_result_buffer();
+}
+
+static inline void setScanEngineIdle() {
+  scan_phase = ScanPhase::Idle;
+  spi_status = SCANNER_STATUS_OK;
+  scannerStatusLedSet(false);
+}
+
+static inline void abortScanAndSetIdle() {
+  clear_scan_results();
+  clear_spi_result_buffer();
+  setScanEngineIdle();
 }
 
 static void write_status_response(int8_t value) {
@@ -185,7 +187,7 @@ static void logDedupeSuppressedSummary() {
 #endif
 
 static void process_scan_results_into_spi_buffer(int budget = 4) {
-  if (!scan_processing) {
+  if (scan_phase != ScanPhase::Processing) {
     return;
   }
 
@@ -194,15 +196,14 @@ static void process_scan_results_into_spi_buffer(int budget = 4) {
   while (scan_index < scan_count &&
          spi_result_count < PROTO_MAX_RESULTS &&
          processed < budget) {
+    const int raw_index = scan_index++;
+    processed++;
+
     WiFiResult r = {};
-    if (!scannerRadioReadResult(scan_index, r)) {
+    if (!scannerRadioReadResult(raw_index, r)) {
       // Skip unreadable raw entries but keep progressing the snapshot cursor.
-      scan_index++;
-      processed++;
       continue;
     }
-    scan_index++;
-    processed++;
 
     if (!wifiResultIsValidForDedupe(r)) {
       // Ignore invalid radio results so they don't poison dedupe state.
@@ -213,7 +214,7 @@ static void process_scan_results_into_spi_buffer(int budget = 4) {
     wifiDedupeHashFromResult(r, hash);
     if (!wifiDedupeTableRemember(&scan_dedupe_table, &hash)) {
 #if LOG_DEDUPE_HITS
-      noteDedupeHit(scan_index - 1, r);
+      noteDedupeHit(raw_index, r);
 #endif
       continue;
     }
@@ -228,9 +229,10 @@ static void process_scan_results_into_spi_buffer(int budget = 4) {
     logDedupeSuppressedSummary();
 #endif
     clear_scan_results();
+    scan_phase = ScanPhase::Idle;
     spi_status = static_cast<int8_t>(spi_result_count);
     // Snapshot fully processed; scanner is now idle from RF perspective.
-    scannerStatusLedWrite(false);
+    scannerStatusLedSet(false);
     Serial.printf("Buffered %u unique results (band %u ch %u)\n",
                   (unsigned)spi_result_count, last_scan_band, last_scan_channel);
   }
@@ -239,8 +241,7 @@ static void process_scan_results_into_spi_buffer(int budget = 4) {
 static void start_channel_scan(uint8_t band, uint8_t channel) {
   // Discard any previous snapshot before starting a new scan.
   clear_scan_results();
-  clear_spi_result_buffer();
-  spi_status = SCAN_STATUS_OK;
+  setResultBufferIdle();
 
   // DFS channels should be passive to avoid radar CAC delays, 210ms dwell
   const bool passive = is_dfs_channel(band, channel);
@@ -258,26 +259,22 @@ static void start_channel_scan(uint8_t band, uint8_t channel) {
 
   if (n == SCANNER_RADIO_SCAN_FAILED) {
     Serial.printf("Scan start failed on band %u ch %u (ret=%d)\n", band, channel, n);
-    scan_active = false;
-    scan_processing = false;
-    last_scan_status = SCAN_STATUS_START_FAILED;
-    spi_status = SCAN_STATUS_OK;
-    scannerStatusLedWrite(false);
+    setScanEngineIdle();
+    last_scan_status = SCANNER_STATUS_START_FAILED;
     return;
   }
 
-  scan_active = true;
-  scan_processing = false;
-  last_scan_status = SCAN_STATUS_OK;
-  spi_status = SCAN_STATUS_BUSY;
-  scannerStatusLedWrite(true);
+  scan_phase = ScanPhase::Scanning;
+  last_scan_status = SCANNER_STATUS_OK;
+  spi_status = SCANNER_STATUS_BUSY;
+  scannerStatusLedSet(true);
   Serial.printf("Started scan band %u ch %u (%s, %dms, ret=%d)\n",
                 band, channel, passive ? "passive" : "active", dwell, n);
 }
 
 static void update_scan_state() {
   // Phase 1: poll radio async state until scan snapshot is complete.
-  if (scan_active) {
+  if (scan_phase == ScanPhase::Scanning) {
     const int n = scannerRadioPollAsyncScan();
 
     if (n == SCANNER_RADIO_SCAN_RUNNING) {
@@ -286,21 +283,15 @@ static void update_scan_state() {
 
     if (n < 0) {
       // Failed or aborted.
-      clear_scan_results();
-      clear_spi_result_buffer();
-      scan_active = false;
-      scan_processing = false;
-      spi_status = SCAN_STATUS_OK;
-      scannerStatusLedWrite(false);
+      abortScanAndSetIdle();
       Serial.println("Scan failed/aborted");
       return;
     }
 
     // Scan completed: keep status busy while we process and dedupe.
-    scan_active = false;
-    scan_processing = true;
+    scan_phase = ScanPhase::Processing;
     scan_index = 0;
-    spi_status = SCAN_STATUS_BUSY;
+    spi_status = SCANNER_STATUS_BUSY;
 
     // Safety: enforce protocol max.
     if (n > PROTO_MAX_RESULTS) {
@@ -316,7 +307,7 @@ static void update_scan_state() {
   }
 
   // Phase 2: post-process raw snapshot into deduped SPI buffer.
-  if (scan_processing) {
+  if (scan_phase == ScanPhase::Processing) {
     process_scan_results_into_spi_buffer();
   }
 }
@@ -332,6 +323,93 @@ static void write_result_packet(ResultType type, const WiFiResult* r = nullptr) 
   memcpy(tx_buf, &pkt, sizeof(pkt));
 }
 
+static void handleCmdNop() {
+  // Return current scanner status/count semantics as a convenience.
+  const int8_t c = spi_status;
+  write_status_response(c);
+  DBG_PRINTF("[SPI] rsp NOP => count=%d\n", c);
+}
+
+static void handleCmdId() {
+  DeviceIdReply id = {};
+  id.proto_version = PROTO_VERSION;
+  id.scanner_type  = SCANNER_TYPE_ESP32_C5;
+  id.capabilities  = (CAP_BAND_24GHZ | CAP_BAND_5GHZ);
+  id.max_results   = PROTO_MAX_RESULTS;
+  memcpy(tx_buf, &id, sizeof(id));
+  DBG_PRINTF("[SPI] rsp ID => proto=%u type=%u caps=0x%02X max=%u\n",
+             id.proto_version, id.scanner_type, id.capabilities, id.max_results);
+}
+
+static void handleCmdScan() {
+  // Note: response comes next transaction: we return last_scan_status (int8_t)
+  ScanCommand sc = {};
+  memcpy(&sc, rx_buf, sizeof(sc));
+
+  // Reject new scans while a previous scan/snapshot/buffer is still in flight.
+  if (scan_phase != ScanPhase::Idle || spi_status > 0) {
+    last_scan_status = SCANNER_STATUS_BUSY;
+  } else if (!wifiBandChannelValid(sc.band, sc.channel)) {
+    last_scan_status = SCANNER_STATUS_INVALID;
+    DBG_PRINTF("[SCAN] invalid request raw=%02X,%02X,%02X,%02X\n",
+               rx_buf[0], rx_buf[1], rx_buf[2], rx_buf[3]);
+  } else {
+    last_scan_status = SCANNER_STATUS_OK;
+    start_channel_scan(sc.band, sc.channel);
+  }
+
+  write_status_response(last_scan_status);
+  DBG_PRINTF("[SPI] rsp SCAN => status=%d (band=%u ch=%u)\n",
+             last_scan_status, sc.band, sc.channel);
+}
+
+static void handleCmdResultCount() {
+  update_scan_state();  // Ensure we progress scan completion even if master polls slowly.
+  const int8_t c = spi_status;
+  write_status_response(c);
+  DBG_PRINTF("[SPI] rsp RESULT_COUNT => %d (phase=%u total=%d idx=%d)\n",
+             c, (unsigned)scan_phase, scan_count, scan_index);
+}
+
+static void handleCmdResultGet() {
+  update_scan_state();
+
+  if (spi_status == SCANNER_STATUS_BUSY) {
+    write_result_packet(RESULT_BUSY);
+    DBG_PRINTLN("[SPI] rsp RESULT_GET => BUSY");
+    return;
+  }
+
+  // No buffered results ready -> end marker.
+  if (spi_status <= 0 || spi_result_count == 0 || spi_result_index >= spi_result_count) {
+    write_result_packet(RESULT_END);
+    DBG_PRINTLN("[SPI] rsp RESULT_GET => END");
+    // END always collapses transfer state back to idle.
+    setResultBufferIdle();
+    return;
+  }
+
+  const WiFiResult& r = spi_results[spi_result_index++];
+  write_result_packet(RESULT_WIFI, &r);
+
+  const int remaining = (int)spi_result_count - (int)spi_result_index;
+  if (remaining > 0) {
+    spi_status = static_cast<int8_t>(remaining);
+  } else {
+    setResultBufferIdle();
+  }
+
+  DBG_PRINTF("[SPI] rsp RESULT_GET => WIFI out=%u/%u ssid='%s' rssi=%d ch=%u band=%u\n",
+             (unsigned)spi_result_index, (unsigned)spi_result_count,
+             r.ssid, r.rssi, r.channel, r.band);
+}
+
+static void handleCmdDedupeReset() {
+  // Keep slave dedupe reset boot-only.
+  write_status_response(0);
+  DBG_PRINTLN("[SPI] rsp DEDUPE_RESET => ignored");
+}
+
 // ---------- Command handling ----------
 // This fills tx_buf with the *next* response (to be clocked out on the next transaction).
 static void handle_command(uint8_t cmd_byte) {
@@ -345,100 +423,12 @@ static void handle_command(uint8_t cmd_byte) {
              cmd_byte, cmd_to_str(cmd_byte), rx_buf[1], rx_buf[2], rx_buf[3]);
 
   switch (cmd) {
-    case CMD_NOP: {
-      // Return result_count semantics as a convenience.
-      const int8_t c = spi_status;
-      write_status_response(c);
-      DBG_PRINTF("[SPI] rsp NOP => count=%d\n", c);
-      break;
-    }
-
-    case CMD_ID: {
-      DeviceIdReply id = {};
-      id.proto_version = PROTO_VERSION;
-      id.scanner_type  = SCANNER_TYPE_ESP32_C5;
-      id.capabilities  = (CAP_BAND_24GHZ | CAP_BAND_5GHZ);
-      id.max_results   = PROTO_MAX_RESULTS;
-      memcpy(tx_buf, &id, sizeof(id));
-      DBG_PRINTF("[SPI] rsp ID => proto=%u type=%u caps=0x%02X max=%u\n",
-                 id.proto_version, id.scanner_type, id.capabilities, id.max_results);
-      break;
-    }
-
-    case CMD_SCAN: {
-      // Note: response comes next transaction: we return last_scan_status (int8_t)
-      ScanCommand sc = {};
-      memcpy(&sc, rx_buf, sizeof(sc));
-
-      // Reject new scans while a previous scan/snapshot/buffer is still in flight.
-      if (scan_active || scan_processing || spi_status > 0) {
-        last_scan_status = SCAN_STATUS_BUSY;
-      } else if (!wifiBandChannelValid(sc.band, sc.channel)) {
-        last_scan_status = SCAN_STATUS_INVALID;
-        DBG_PRINTF("[SCAN] invalid request raw=%02X,%02X,%02X,%02X\n",
-                   rx_buf[0], rx_buf[1], rx_buf[2], rx_buf[3]);
-      } else {
-        last_scan_status = SCAN_STATUS_OK;
-        start_channel_scan(sc.band, sc.channel);
-      }
-
-      write_status_response(last_scan_status);
-      DBG_PRINTF("[SPI] rsp SCAN => status=%d (band=%u ch=%u)\n",
-                 last_scan_status, sc.band, sc.channel);
-      break;
-    }
-
-    case CMD_RESULT_COUNT: {
-      update_scan_state(); // ensure we progress scan completion even if master polls slowly
-      const int8_t c = spi_status;
-      write_status_response(c);
-      DBG_PRINTF("[SPI] rsp RESULT_COUNT => %d (active=%d total=%d idx=%d)\n",
-                 c, scan_active ? 1 : 0, scan_count, scan_index);
-      break;
-    }
-
-    case CMD_RESULT_GET: {
-      update_scan_state();
-
-      if (spi_status == SCAN_STATUS_BUSY) {
-        write_result_packet(RESULT_BUSY);
-        DBG_PRINTLN("[SPI] rsp RESULT_GET => BUSY");
-        break;
-      }
-
-      // No buffered results ready -> end marker.
-      if (spi_status <= 0 || spi_result_count == 0 || spi_result_index >= spi_result_count) {
-        write_result_packet(RESULT_END);
-        DBG_PRINTLN("[SPI] rsp RESULT_GET => END");
-        // END always collapses transfer state back to idle.
-        spi_status = SCAN_STATUS_OK;
-        clear_spi_result_buffer();
-        break;
-      }
-
-      const WiFiResult& r = spi_results[spi_result_index++];
-      write_result_packet(RESULT_WIFI, &r);
-
-      const int remaining = (int)spi_result_count - (int)spi_result_index;
-      if (remaining > 0) {
-        spi_status = static_cast<int8_t>(remaining);
-      } else {
-        spi_status = SCAN_STATUS_OK;
-        clear_spi_result_buffer();
-      }
-
-      DBG_PRINTF("[SPI] rsp RESULT_GET => WIFI out=%u/%u ssid='%s' rssi=%d ch=%u band=%u\n",
-                 (unsigned)spi_result_index, (unsigned)spi_result_count,
-                 r.ssid, r.rssi, r.channel, r.band);
-      break;
-    }
-
-    case CMD_DEDUPE_RESET: {
-      // Keep slave dedupe reset boot-only.
-      write_status_response(0);
-      DBG_PRINTLN("[SPI] rsp DEDUPE_RESET => ignored");
-      break;
-    }
+    case CMD_NOP: handleCmdNop(); break;
+    case CMD_ID: handleCmdId(); break;
+    case CMD_SCAN: handleCmdScan(); break;
+    case CMD_RESULT_COUNT: handleCmdResultCount(); break;
+    case CMD_RESULT_GET: handleCmdResultGet(); break;
+    case CMD_DEDUPE_RESET: handleCmdDedupeReset(); break;
 
     default:
       // Unknown command: return 0
@@ -449,7 +439,10 @@ static void handle_command(uint8_t cmd_byte) {
 
 void setup() {
   Serial.begin(115200);
-  scannerStatusLedInitBootOn();
+  if (SCANNER_STATUS_LED_ENABLED && ((int)SCANNER_STATUS_LED_PIN >= 0)) {
+    pinMode(SCANNER_STATUS_LED_PIN, OUTPUT);
+  }
+  scannerStatusLedSet(true);
   // Keep reboot-to-SPI-ready latency low so the Pico can recover quickly.
   delay(100);
 
@@ -473,7 +466,7 @@ void setup() {
   wifiDedupeTableReset(&scan_dedupe_table);
 
   // Boot complete: scanner is ready/idle.
-  scannerStatusLedWrite(false);
+  scannerStatusLedSet(false);
   Serial.println("SPI slave ready");
 }
 
@@ -484,7 +477,7 @@ void loop() {
   // Ensure rx_buf doesn't contain stale data (not strictly required, but helps debugging).
   memset(rx_buf, 0, FRAME_SIZE);
 
-  // Wait for a SPI transaction; use a timeout so we can keep scanComplete() ticking.
+  // Wait for a SPI transaction; timeout keeps async scan polling progressing.
   const int ret = scannerSpiSlaveTransfer(tx_buf, rx_buf, FRAME_SIZE, SPI_RX_TIMEOUT_MS);
 
   if (ret == SCANNER_SPI_TRANSFER_TIMEOUT) {

@@ -1,4 +1,4 @@
-#include "pico_master_logging.h"
+#include "pico_logging.h"
 
 #include <SPI.h>
 
@@ -9,117 +9,15 @@
 #include <sys/time.h>
 #include <time.h>
 
-#include "spi_protocol_shared.h"
-
 namespace pico_logging {
 namespace {
 
-void appendAuthToken(char* out, size_t out_len, const char* token) {
-  if (!out || out_len == 0 || !token || token[0] == '\0') {
-    return;
-  }
-
-  const size_t used = strlen(out);
-  if (used >= (out_len - 1)) {
-    return;
-  }
-
-  const size_t remaining = out_len - used - 1;
-  strncat(out, token, remaining);
-  out[out_len - 1] = '\0';
-}
-
-void appendProtocolAuthToken(char* out,
-                             size_t out_len,
-                             const char* proto,
-                             bool psk,
-                             bool eap,
-                             bool tkip,
-                             bool ccmp) {
-  char token[48] = {};
-  size_t pos = 0;
-  pos += (size_t)snprintf(token + pos, sizeof(token) - pos, "[%s", proto);
-
-  if (psk) {
-    pos += (size_t)snprintf(token + pos, sizeof(token) - pos, "-PSK");
-  } else if (eap) {
-    pos += (size_t)snprintf(token + pos, sizeof(token) - pos, "-EAP");
-  }
-
-  if (tkip && ccmp) {
-    pos += (size_t)snprintf(token + pos, sizeof(token) - pos, "-CCMP+TKIP");
-  } else if (ccmp) {
-    pos += (size_t)snprintf(token + pos, sizeof(token) - pos, "-CCMP");
-  } else if (tkip) {
-    pos += (size_t)snprintf(token + pos, sizeof(token) - pos, "-TKIP");
-  }
-
-  (void)snprintf(token + pos, sizeof(token) - pos, "]");
-  appendAuthToken(out, out_len, token);
-}
+// Some GNSS modules emit 2080+ placeholder dates before RTC/fix is valid.
+static constexpr uint16_t GNSS_INVALID_RTC_YEAR_FLOOR = 2080;
 
 }  // namespace
 
 Logger* Logger::date_time_callback_instance_ = nullptr;
-
-void formatBssid(const uint8_t* bssid, char* out, size_t out_len) {
-  snprintf(out, out_len, "%02X:%02X:%02X:%02X:%02X:%02X",
-           bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
-}
-
-void wigleCsvEscape(const char* in, char* out, size_t out_len) {
-  size_t j = 0;
-  if (out_len == 0) return;
-  out[j++] = '"';
-  for (size_t i = 0; in[i] != '\0' && j + 2 < out_len; i++) {
-    if (in[i] == '"') {
-      if (j + 2 >= out_len) break;
-      out[j++] = '"';
-      out[j++] = '"';
-    } else {
-      out[j++] = in[i];
-    }
-  }
-  out[j++] = '"';
-  out[j] = '\0';
-}
-
-void buildAndroidCapabilitiesString(uint16_t caps, char* out, size_t out_len) {
-  if (!out || out_len == 0) {
-    return;
-  }
-
-  out[0] = '\0';
-
-  const bool has_wep = (caps & CAP_WEP) != 0;
-  const bool has_wpa = (caps & CAP_WPA) != 0;
-  const bool has_wpa2 = (caps & CAP_WPA2) != 0;
-  const bool has_wpa3 = (caps & CAP_WPA3) != 0;
-  const bool has_psk = (caps & CAP_PSK) != 0;
-  const bool has_eap = (caps & CAP_EAP) != 0;
-  const bool has_tkip = (caps & CAP_TKIP) != 0;
-  const bool has_ccmp = (caps & CAP_CCMP) != 0;
-
-  if (has_wep) {
-    appendAuthToken(out, out_len, "[WEP]");
-  }
-  if (has_wpa) {
-    appendProtocolAuthToken(out, out_len, "WPA", has_psk, has_eap, has_tkip, has_ccmp);
-  }
-  if (has_wpa2) {
-    appendProtocolAuthToken(out, out_len, "WPA2", has_psk, has_eap, has_tkip, has_ccmp);
-  }
-  if (has_wpa3) {
-    appendProtocolAuthToken(out, out_len, "RSN", has_psk, has_eap, has_tkip, has_ccmp);
-  }
-
-  if (out[0] == '\0') {
-    appendAuthToken(out, out_len, "[OPEN]");
-  }
-  if ((caps & CAP_ESS) != 0) {
-    appendAuthToken(out, out_len, "[ESS]");
-  }
-}
 
 Logger::Logger(SdFat& sd,
                FsFile& log_file,
@@ -165,6 +63,7 @@ bool Logger::gnssDateTimeValid() const {
   return gps_.date.isValid() &&
          gps_.time.isValid() &&
          gps_.date.year() >= config_.gnss_min_valid_year &&
+         gps_.date.year() < GNSS_INVALID_RTC_YEAR_FLOOR &&
          gps_.date.month() >= 1 && gps_.date.month() <= 12 &&
          gps_.date.day() >= 1 && gps_.date.day() <= 31 &&
          gps_.time.hour() <= 23 &&
@@ -241,7 +140,7 @@ void Logger::syncMasterClockFromGnss() {
 }
 
 bool Logger::ensureBootTimestampFromClock() {
-  if (state_.wigle_boot_timestamp[0] != '\0') {
+  if (state_.csv_boot_timestamp[0] != '\0') {
     return true;
   }
 
@@ -256,12 +155,12 @@ bool Logger::ensureBootTimestampFromClock() {
     return false;
   }
 
-  if (strftime(state_.wigle_boot_timestamp, sizeof(state_.wigle_boot_timestamp),
+  if (strftime(state_.csv_boot_timestamp, sizeof(state_.csv_boot_timestamp),
                "%Y%m%d%H%M%S", &tm_utc) == 0) {
     return false;
   }
   serial_.print("Log boot timestamp: ");
-  serial_.println(state_.wigle_boot_timestamp);
+  serial_.println(state_.csv_boot_timestamp);
   return true;
 }
 
@@ -364,24 +263,24 @@ void Logger::captureBootTimestampFromGnss() {
   }
 }
 
-bool Logger::selectWigleLogPath() {
-  if (!state_.sd_ready || state_.wigle_boot_timestamp[0] == '\0') {
+bool Logger::selectCsvLogPath() {
+  if (!state_.sd_ready || state_.csv_boot_timestamp[0] == '\0') {
     return false;
   }
-  if (state_.wigle_path_selected) {
+  if (state_.csv_path_selected) {
     return true;
   }
 
   for (uint16_t suffix = 0; suffix < 100; suffix++) {
     if (suffix == 0) {
-      snprintf(state_.wigle_log_path, sizeof(state_.wigle_log_path),
-               "/WIGLE_%s.CSV", state_.wigle_boot_timestamp);
+      snprintf(state_.csv_log_path, sizeof(state_.csv_log_path),
+               "/CSVLOG_%s.CSV", state_.csv_boot_timestamp);
     } else {
-      snprintf(state_.wigle_log_path, sizeof(state_.wigle_log_path),
-               "/WIGLE_%s_%02u.CSV", state_.wigle_boot_timestamp, suffix);
+      snprintf(state_.csv_log_path, sizeof(state_.csv_log_path),
+               "/CSVLOG_%s_%02u.CSV", state_.csv_boot_timestamp, suffix);
     }
-    if (!sd_.exists(state_.wigle_log_path)) {
-      state_.wigle_path_selected = true;
+    if (!sd_.exists(state_.csv_log_path)) {
+      state_.csv_path_selected = true;
       return true;
     }
   }
@@ -443,7 +342,7 @@ bool Logger::mountSdWithRetries(int max_attempts) {
   return false;
 }
 
-bool Logger::initWigleCsv(const char* path) {
+bool Logger::initCsvLog(const char* path) {
   const bool exists = sd_.exists(path);
   log_file_ = sd_.open(path, O_RDWR | O_CREAT | O_APPEND);
   if (!log_file_) return false;
@@ -453,8 +352,8 @@ bool Logger::initWigleCsv(const char* path) {
     log_file_.println("MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type");
     log_file_.flush();
   }
-  state_.wigle_dirty = false;
-  state_.wigle_last_flush_ms = millis();
+  state_.csv_dirty = false;
+  state_.csv_last_flush_ms = millis();
   return true;
 }
 
@@ -465,21 +364,21 @@ void Logger::disableSdLoggingAndScheduleRetry(const char* reason) {
   if (log_file_) {
     log_file_.close();
   }
-  state_.wigle_ready = false;
-  state_.wigle_dirty = false;
+  state_.csv_ready = false;
+  state_.csv_dirty = false;
   state_.sd_ready = false;
   state_.sd_next_retry_ms = millis() + config_.sd_retry_background_ms;
 }
 
 void Logger::tryRecoverSdLogging() {
-  if (state_.wigle_ready) {
+  if (state_.csv_ready) {
     return;
   }
 
   const uint32_t now = millis();
   const uint32_t retry_interval =
-      (state_.sd_ready && state_.wigle_boot_timestamp[0] == '\0')
-          ? config_.wigle_time_wait_retry_ms
+      (state_.sd_ready && state_.csv_boot_timestamp[0] == '\0')
+          ? config_.csv_time_wait_retry_ms
           : config_.sd_retry_background_ms;
   if ((int32_t)(now - state_.sd_next_retry_ms) < 0) {
     return;
@@ -501,45 +400,40 @@ void Logger::tryRecoverSdLogging() {
     if (!state_.sd_ready) {
       return;
     }
-    state_.wigle_path_selected = false;
+    state_.csv_path_selected = false;
   }
 
   if (!ensureBootTimestampFromClock()) {
-    serial_.println("Waiting for valid GNSS time before creating WiGLE log file");
+    serial_.println("Waiting for valid GNSS time before creating CSV log file");
     return;
   }
 
-  if (!selectWigleLogPath()) {
-    serial_.println("WiGLE path selection failed");
+  if (!selectCsvLogPath()) {
+    serial_.println("CSV log path selection failed");
     return;
   }
 
-  state_.wigle_ready = initWigleCsv(state_.wigle_log_path);
-  if (state_.wigle_ready) {
-    serial_.print("WiGLE CSV ready: ");
-    serial_.println(state_.wigle_log_path);
+  state_.csv_ready = initCsvLog(state_.csv_log_path);
+  if (state_.csv_ready) {
+    serial_.print("CSV log ready: ");
+    serial_.println(state_.csv_log_path);
   } else {
-    serial_.print("WiGLE CSV open failed: ");
-    serial_.println(state_.wigle_log_path);
+    serial_.print("CSV log open failed: ");
+    serial_.println(state_.csv_log_path);
   }
 }
 
-void Logger::appendWigleRow(const QueuedScanResult& r) {
-  if (!state_.wigle_ready || !log_file_) return;
+void Logger::appendCsvRow(const QueuedScanResult& r) {
+  if (!state_.csv_ready || !log_file_) return;
 
-  char mac[18];
   char ts[20];
-  char ssid_csv[80];
-  char auth_mode[96];
   char lat_csv[20] = "";
   char lon_csv[20] = "";
   char alt_csv[20] = "";
   char acc_csv[20] = "";
+  char row_csv[384] = "";
 
-  formatBssid(r.bssid, mac, sizeof(mac));
   formatGpsTimestamp(ts, sizeof(ts));
-  wigleCsvEscape(r.ssid, ssid_csv, sizeof(ssid_csv));
-  buildAndroidCapabilitiesString(r.capabilities, auth_mode, sizeof(auth_mode));
 
   const bool have_location =
       gps_.location.isValid() &&
@@ -562,54 +456,60 @@ void Logger::appendWigleRow(const QueuedScanResult& r) {
     snprintf(acc_csv, sizeof(acc_csv), "%.2f", gps_.hdop.hdop() * 5.0);
   }
   if (!have_location) {
-    state_.wigle_rows_blank_gps++;
+    state_.csv_rows_blank_gps++;
   }
 
-  log_file_.printf("%s,%s,%s,%s,%u,%d,%s,%s,%s,%s,WIFI\n",
-                   mac,
-                   ssid_csv,
-                   auth_mode,
-                   ts,
-                   (unsigned)r.channel,
-                   (int)r.rssi,
-                   lat_csv,
-                   lon_csv,
-                   alt_csv,
-                   acc_csv);
-  if (log_file_.getWriteError()) {
-    disableSdLoggingAndScheduleRetry("WiGLE write error; disabling SD logging until recovery");
+  if (!buildCsvWifiRow(r.bssid,
+                       r.ssid,
+                       r.capabilities,
+                       ts,
+                       r.channel,
+                       r.rssi,
+                       lat_csv,
+                       lon_csv,
+                       alt_csv,
+                       acc_csv,
+                       row_csv,
+                       sizeof(row_csv))) {
+    disableSdLoggingAndScheduleRetry("CSV row format error; disabling SD logging until recovery");
     return;
   }
-  state_.wigle_dirty = true;
 
-  state_.wigle_rows++;
-  if ((state_.wigle_rows % 25) == 0) {
+  log_file_.print(row_csv);
+  if (log_file_.getWriteError()) {
+    disableSdLoggingAndScheduleRetry("CSV log write error; disabling SD logging until recovery");
+    return;
+  }
+  state_.csv_dirty = true;
+
+  state_.csv_rows++;
+  if ((state_.csv_rows % 25) == 0) {
     log_file_.flush();
     if (log_file_.getWriteError()) {
-      disableSdLoggingAndScheduleRetry("WiGLE flush error; disabling SD logging until recovery");
+      disableSdLoggingAndScheduleRetry("CSV log flush error; disabling SD logging until recovery");
       return;
     }
-    state_.wigle_dirty = false;
-    state_.wigle_last_flush_ms = millis();
+    state_.csv_dirty = false;
+    state_.csv_last_flush_ms = millis();
   }
 }
 
-void Logger::flushWigleIfDue() {
-  if (!state_.wigle_ready || !log_file_ || !state_.wigle_dirty) {
+void Logger::flushCsvIfDue() {
+  if (!state_.csv_ready || !log_file_ || !state_.csv_dirty) {
     return;
   }
   const uint32_t now = millis();
-  if ((int32_t)(now - state_.wigle_last_flush_ms) < (int32_t)config_.wigle_flush_interval_ms) {
+  if ((int32_t)(now - state_.csv_last_flush_ms) < (int32_t)config_.csv_flush_interval_ms) {
     return;
   }
 
   log_file_.flush();
   if (log_file_.getWriteError()) {
-    disableSdLoggingAndScheduleRetry("WiGLE periodic flush error; disabling SD logging until recovery");
+    disableSdLoggingAndScheduleRetry("CSV log periodic flush error; disabling SD logging until recovery");
     return;
   }
-  state_.wigle_dirty = false;
-  state_.wigle_last_flush_ms = now;
+  state_.csv_dirty = false;
+  state_.csv_last_flush_ms = now;
 }
 
 }  // namespace pico_logging

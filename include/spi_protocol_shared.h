@@ -46,6 +46,14 @@ enum ResultType : uint8_t {
   RESULT_END  = 0xFF,
 };
 
+// On-wire scan/status codes returned by CMD_SCAN and CMD_RESULT_COUNT.
+enum ScannerStatus : int8_t {
+  SCANNER_STATUS_OK = 0,
+  SCANNER_STATUS_BUSY = -1,
+  SCANNER_STATUS_INVALID = -2,
+  SCANNER_STATUS_START_FAILED = -3,
+};
+
 static constexpr size_t SPI_FRAME_SIZE = 64;
 static constexpr size_t SPI_FRAME_TAG_INDEX = SPI_FRAME_SIZE - 1;
 
