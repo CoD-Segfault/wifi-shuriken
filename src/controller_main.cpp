@@ -144,7 +144,9 @@ static constexpr uint8_t SCANNER_QUERY_CMD_RETRIES = 2;
 static constexpr int SCANNER_PIN_SCK = ESP_PIN_SCK;
 static constexpr int SCANNER_PIN_MOSI = ESP_PIN_MOSI;
 static constexpr int SCANNER_PIN_MISO = ESP_PIN_MISO;
+#if defined(ESP_PIN_CS)
 static constexpr int SCANNER_PIN_CS = ESP_PIN_CS;
+#endif
 static constexpr uint32_t SCANNER_INTERFRAME_US = ESP_INTERFRAME_US;
 static constexpr uint8_t SCANNER_DEVICE_TYPE = SCANNER_TYPE_ESP32_C5;
 // Local transport status (not on-wire protocol).
