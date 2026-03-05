@@ -1,4 +1,5 @@
 #include "pico_logging.h"
+#include "Configuration.h"
 
 #include <SPI.h>
 
@@ -348,7 +349,10 @@ bool Logger::initCsvLog(const char* path) {
   if (!log_file_) return false;
 
   if (!exists || log_file_.size() == 0) {
-    log_file_.println("WigleWifi-1.4,appRelease=WiFiShuriken,model=Pico2,release=1.0,device=RP2350,display=none,board=rpipico2,brand=custom");
+    log_file_.println(
+        "WigleWifi-1.4,appRelease=" APP_RELEASE_VERSION
+        ",model=WiFi-Shuriken,release=" RELEASE_VERSION
+        ",device=WiFi-Shuriken,display=none,board=WiFi-Shuriken,brand=CoD_Segfault");
     log_file_.println("MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type");
     log_file_.flush();
   }
@@ -513,4 +517,3 @@ void Logger::flushCsvIfDue() {
 }
 
 }  // namespace pico_logging
-

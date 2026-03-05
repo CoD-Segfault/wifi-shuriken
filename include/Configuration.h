@@ -1,5 +1,16 @@
 #pragma once
 
+// Firmware version used in CSV metadata fields.
+#ifndef APP_VERSION
+#define APP_VERSION "0.1"
+#endif
+#ifndef APP_RELEASE_VERSION
+#define APP_RELEASE_VERSION APP_VERSION
+#endif
+#ifndef RELEASE_VERSION
+#define RELEASE_VERSION APP_VERSION
+#endif
+
 // SD card SPI0 pin mapping on the Pico master.
 #ifndef SD_PIN_SCK
 #define SD_PIN_SCK 2  // XIAO RP2350 D8: SPI0 clock line to SD card.
