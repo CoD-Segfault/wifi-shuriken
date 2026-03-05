@@ -20,16 +20,16 @@
 */
 
 #ifndef PIN_SCK
-#define PIN_SCK   6
+#define PIN_SCK   8
 #endif
 #ifndef PIN_MOSI
-#define PIN_MOSI  1
+#define PIN_MOSI  10
 #endif
 #ifndef PIN_MISO
-#define PIN_MISO  0
+#define PIN_MISO  9
 #endif
 #ifndef PIN_CS
-#define PIN_CS    24
+#define PIN_CS    7
 #endif
 
 #ifndef LED_BUILTIN
@@ -39,10 +39,10 @@
 #define SCANNER_STATUS_LED_ENABLED 1
 #endif
 #ifndef SCANNER_STATUS_LED_PIN
-#define SCANNER_STATUS_LED_PIN LED_BUILTIN
+#define SCANNER_STATUS_LED_PIN 27
 #endif
 #ifndef SCANNER_STATUS_LED_ACTIVE_LOW
-#define SCANNER_STATUS_LED_ACTIVE_LOW 0
+#define SCANNER_STATUS_LED_ACTIVE_LOW 1
 #endif
 
 // ---------- Debug ----------

@@ -2,16 +2,16 @@
 
 // SD card SPI0 pin mapping on the Pico master.
 #ifndef SD_PIN_SCK
-#define SD_PIN_SCK 2  // SPI0 clock line to SD card.
+#define SD_PIN_SCK 2  // XIAO RP2350 D8: SPI0 clock line to SD card.
 #endif
 #ifndef SD_PIN_MOSI
-#define SD_PIN_MOSI 3  // SPI0 MOSI line to SD card.
+#define SD_PIN_MOSI 3  // XIAO RP2350 D10: SPI0 MOSI line to SD card.
 #endif
 #ifndef SD_PIN_MISO
-#define SD_PIN_MISO 4  // SPI0 MISO line from SD card.
+#define SD_PIN_MISO 4  // XIAO RP2350 D9: SPI0 MISO line from SD card.
 #endif
 #ifndef SD_PIN_CS
-#define SD_PIN_CS 5  // SD card chip-select pin.
+#define SD_PIN_CS 21  // XIAO RP2350 D11: SD card chip-select pin.
 #endif
 
 // Preferred SD card SPI bus speed in Hz for normal operation.
@@ -26,13 +26,13 @@
 
 // Scanner SPI1 pin mapping on the Pico master (legacy ESP_PIN_* macro names).
 #ifndef ESP_PIN_SCK
-#define ESP_PIN_SCK 10  // SPI1 clock line to scanner module.
+#define ESP_PIN_SCK 10  // XIAO RP2350 D17: SPI1 clock line to scanner module.
 #endif
 #ifndef ESP_PIN_MOSI
-#define ESP_PIN_MOSI 11  // SPI1 MOSI line to scanner module.
+#define ESP_PIN_MOSI 11  // XIAO RP2350 D15: SPI1 MOSI line to scanner module.
 #endif
 #ifndef ESP_PIN_MISO
-#define ESP_PIN_MISO 12  // SPI1 MISO line from scanner module.
+#define ESP_PIN_MISO 12  // XIAO RP2350 D16: SPI1 MISO line from scanner module.
 #endif
 
 // Scanner SPI bus clock in Hz (Pico master <-> scanner slaves).
@@ -48,7 +48,7 @@
 
 // Scanner CS wiring mode: 0 = direct GPIO CS, 1 = 74HC595 shift-register CS.
 #ifndef SCANNER_USE_SHIFTREG_CS
-#define SCANNER_USE_SHIFTREG_CS 0  // 0: direct CS pin, 1: shift-register CS.
+#define SCANNER_USE_SHIFTREG_CS 1  // XIAO RP2350 default: shift-register CS.
 #endif
 
 // Direct GPIO CS pin when shift-register CS mode is disabled.
@@ -60,10 +60,10 @@
 
 // Shift-register control pins and SPI speed when SCANNER_USE_SHIFTREG_CS is enabled.
 #ifndef SCANNER_SHIFTREG_LATCH_PIN
-#define SCANNER_SHIFTREG_LATCH_PIN 15  // 74HC595 latch (RCLK) pin.
+#define SCANNER_SHIFTREG_LATCH_PIN 26  // XIAO RP2350 D0: 74HC595 latch (RCLK).
 #endif
 #ifndef SCANNER_SHIFTREG_OE_PIN
-#define SCANNER_SHIFTREG_OE_PIN 16  // 74HC595 output-enable pin (active low).
+#define SCANNER_SHIFTREG_OE_PIN 9  // XIAO RP2350 D18: 74HC595 OE (active low).
 #endif
 #ifndef SCANNER_SHIFTREG_SPI_HZ
 #define SCANNER_SHIFTREG_SPI_HZ 1000000  // Shift-register SPI clock in Hz.
@@ -87,7 +87,7 @@
 
 // WS2812 status LED configuration.
 #ifndef RGB_PIN
-#define RGB_PIN 14  // WS2812 data pin.
+#define RGB_PIN 22  // XIAO RP2350 onboard WS2812 data pin.
 #endif
 #ifndef NUMPIXELS
 #define NUMPIXELS 1  // Number of chained WS2812 pixels.
@@ -109,13 +109,13 @@
 
 // GNSS UART pin mapping and parser/transport toggles.
 #ifndef GNSS_TX
-#define GNSS_TX 8  // GNSS UART TX pin on Pico.
+#define GNSS_TX 0  // XIAO RP2350 D6: GNSS UART TX.
 #endif
 #ifndef GNSS_RX
-#define GNSS_RX 9  // GNSS UART RX pin on Pico.
+#define GNSS_RX 1  // XIAO RP2350 D7: GNSS UART RX.
 #endif
 #ifndef GNSS_UART
-#define GNSS_UART Serial2  // Hardware UART instance used for GNSS.
+#define GNSS_UART Serial1  // XIAO RP2350 default GNSS UART.
 #endif
 
 // Requested GNSS UART FIFO size in bytes.
