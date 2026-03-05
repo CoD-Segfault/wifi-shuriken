@@ -37,7 +37,7 @@
 
 // Scanner SPI bus clock in Hz (Pico master <-> scanner slaves).
 #ifndef SCANNER_SPI_CLOCK
-#define SCANNER_SPI_CLOCK 20000000  // Conservative default for multi-drop scanner wiring.
+#define SCANNER_SPI_CLOCK 20000000  
 #endif
 
 // Enable RP2040 internal pull-up on scanner MISO to keep idle bus high
