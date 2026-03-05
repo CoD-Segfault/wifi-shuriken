@@ -4,6 +4,7 @@
 #include "wifi_result_utils.h"
 #include "scanner_platform_esp32_radio.h"
 #include "scanner_platform_esp32_spi.h"
+#include <esp_system.h>
 
 /*
   ===== SPI RESPONSE TIMING (IMPORTANT) =====
@@ -72,6 +73,14 @@ static constexpr size_t FRAME_TAG_INDEX = SPI_FRAME_TAG_INDEX;
 static uint8_t rx_buf[FRAME_SIZE] __attribute__((aligned(4)));
 static uint8_t tx_buf[FRAME_SIZE] __attribute__((aligned(4)));
 
+// Boot diagnostics are emitted repeatedly for a short window so they remain visible
+// even when USB CDC enumeration lags behind firmware startup.
+static esp_reset_reason_t boot_reset_reason = ESP_RST_UNKNOWN;
+static uint32_t boot_diag_next_ms = 0;
+static uint8_t boot_diag_emits = 0;
+static constexpr uint8_t BOOT_DIAG_MAX_EMITS = 30;      // 15s at 500ms cadence
+static constexpr uint16_t BOOT_DIAG_PERIOD_MS = 500;
+
 // ---------- Scan state ----------
 // Two-stage pipeline:
 // 1) Radio scan snapshot lifecycle (scan_phase / scan_count / scan_index).
@@ -121,6 +130,43 @@ static const char* cmd_to_str(uint8_t cmd) {
     case CMD_DEDUPE_RESET: return "DEDUPE_RESET";
     default: return "UNKNOWN";
   }
+}
+
+static const char* reset_reason_to_str(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_UNKNOWN: return "UNKNOWN";
+    case ESP_RST_POWERON: return "POWERON";
+    case ESP_RST_EXT: return "EXT";
+    case ESP_RST_SW: return "SW";
+    case ESP_RST_PANIC: return "PANIC";
+    case ESP_RST_INT_WDT: return "INT_WDT";
+    case ESP_RST_TASK_WDT: return "TASK_WDT";
+    case ESP_RST_WDT: return "WDT";
+    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+    case ESP_RST_BROWNOUT: return "BROWNOUT";
+    case ESP_RST_SDIO: return "SDIO";
+    case ESP_RST_USB: return "USB";
+    case ESP_RST_JTAG: return "JTAG";
+    case ESP_RST_EFUSE: return "EFUSE";
+    case ESP_RST_PWR_GLITCH: return "PWR_GLITCH";
+    case ESP_RST_CPU_LOCKUP: return "CPU_LOCKUP";
+    default: return "OTHER";
+  }
+}
+
+static void emitBootDiagnosticsIfDue() {
+  if (boot_diag_emits >= BOOT_DIAG_MAX_EMITS) {
+    return;
+  }
+  const uint32_t now = millis();
+  if ((int32_t)(now - boot_diag_next_ms) < 0) {
+    return;
+  }
+  boot_diag_next_ms = now + BOOT_DIAG_PERIOD_MS;
+  boot_diag_emits++;
+  Serial.printf("Boot reset reason: %d (%s)\n",
+                (int)boot_reset_reason,
+                reset_reason_to_str(boot_reset_reason));
 }
 
 static bool is_dfs_channel(uint8_t band, uint8_t channel) {
@@ -347,7 +393,8 @@ static void handleCmdScan() {
   memcpy(&sc, rx_buf, sizeof(sc));
 
   // Reject new scans while a previous scan/snapshot/buffer is still in flight.
-  if (scan_phase != ScanPhase::Idle || spi_status > 0) {
+  if (scan_phase != ScanPhase::Idle ||
+      spi_status != SCANNER_STATUS_OK) {
     last_scan_status = SCANNER_STATUS_BUSY;
   } else if (!wifiBandChannelValid(sc.band, sc.channel)) {
     last_scan_status = SCANNER_STATUS_INVALID;
@@ -439,6 +486,9 @@ static void handle_command(uint8_t cmd_byte) {
 
 void setup() {
   Serial.begin(115200);
+  boot_reset_reason = esp_reset_reason();
+  boot_diag_next_ms = 0;
+  boot_diag_emits = 0;
   if (SCANNER_STATUS_LED_ENABLED && ((int)SCANNER_STATUS_LED_PIN >= 0)) {
     pinMode(SCANNER_STATUS_LED_PIN, OUTPUT);
   }
@@ -471,6 +521,7 @@ void setup() {
 }
 
 void loop() {
+  emitBootDiagnosticsIfDue();
   // Always progress scan state even if the master is quiet.
   update_scan_state();
 

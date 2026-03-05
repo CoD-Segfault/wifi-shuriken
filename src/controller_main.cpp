@@ -134,12 +134,25 @@ static void updateGpsFixLed(bool usable_fix) {
 
 // ---------- Scanner SPI transport ----------
 static constexpr size_t SCANNER_FRAME_SIZE = SPI_FRAME_SIZE;
-static constexpr uint32_t SCANNER_SPI_HZ = 20000000;
+static constexpr uint32_t SCANNER_SPI_HZ = SCANNER_SPI_CLOCK;
 static constexpr size_t SCANNER_FRAME_TAG_INDEX = SPI_FRAME_TAG_INDEX;
 static constexpr uint8_t SCANNER_SCAN_RESPONSE_PULLS = 24;
+static constexpr uint8_t SCANNER_SCAN_DFS_RESPONSE_PULLS = 48;
+// Keep RESULT_GET pulls relatively high; result packets are larger and may need extra drains.
 static constexpr uint8_t SCANNER_RESULT_RESPONSE_PULLS = 32;
-static constexpr uint8_t SCANNER_SCAN_CMD_RETRIES = 3;
+// Bound per-slot drain work so one scanner cannot monopolize loop time.
+static constexpr uint8_t SCANNER_RESULT_DRAIN_BUDGET = 8;
+// Fast-fail status polling so one missing slot does not stall the round-robin scheduler.
+static constexpr uint8_t SCANNER_RESULT_COUNT_RESPONSE_PULLS = 8;
+static constexpr uint8_t SCANNER_SCAN_CMD_RETRIES = 1;
 static constexpr uint8_t SCANNER_QUERY_CMD_RETRIES = 2;
+static constexpr uint8_t SCANNER_RESULT_COUNT_CMD_RETRIES = 1;
+static constexpr uint8_t SCANNER_RESULT_GET_CMD_RETRIES = 1;
+// SCAN handler on slave can take longer than ID/COUNT before the tagged reply is queued.
+static constexpr uint16_t SCANNER_SCAN_FIRST_PULL_US = 4000;
+static constexpr uint16_t SCANNER_SCAN_DFS_FIRST_PULL_US = 12000;
+static constexpr uint8_t SCANNER_SCAN_BUSY_CONFIRM_POLLS = 1;
+static constexpr uint16_t SCANNER_SCAN_BUSY_CONFIRM_DELAY_US = 2500;
 // Scanner transport hardware config (mapped from legacy config macro names).
 static constexpr int SCANNER_PIN_SCK = ESP_PIN_SCK;
 static constexpr int SCANNER_PIN_MOSI = ESP_PIN_MOSI;
@@ -153,6 +166,8 @@ static constexpr uint8_t SCANNER_DEVICE_TYPE = SCANNER_TYPE_ESP32_C5;
 static constexpr int8_t SCANNER_STATUS_TRANSPORT_TIMEOUT = -4;
 static constexpr uint16_t SCANNER_SLOT_REPROBE_MS = 2000;
 static constexpr uint8_t SCANNER_SLOT_TIMEOUT_REPROBE_THRESHOLD = 8;
+static constexpr uint16_t SCANNER_SLOT_TIMEOUT_BACKOFF_BASE_MS = 10;
+static constexpr uint16_t SCANNER_SLOT_TIMEOUT_BACKOFF_MAX_MS = 200;
 #if SCANNER_USE_SHIFTREG_CS
 static constexpr uint8_t SCANNER_SLOT_COUNT = SCANNER_SHIFTREG_OUTPUTS;
 #else
@@ -160,6 +175,9 @@ static constexpr uint8_t SCANNER_SLOT_COUNT = 1;
 #endif
 static uint8_t scanner_cs_shiftreg_state = 0xFF;
 static uint8_t scanner_active_slot = SCANNER_INITIAL_SLOT;
+#if SCANNER_USE_SHIFTREG_CS
+static bool scanner_shiftreg_outputs_enabled = false;
+#endif
 
 struct ScannerSlotState {
   // Cached identity state for this physical slot.
@@ -170,6 +188,8 @@ struct ScannerSlotState {
   DeviceIdReply id;
   // Re-probe scheduling so absent slots do not get hammered every loop.
   uint32_t next_probe_ms;
+  // Backoff for temporary transport misses while slot remains identified.
+  uint32_t next_service_ms;
   // Transport timeout streak for targeted stale-frame draining.
   uint8_t transport_timeouts;
 };
@@ -181,6 +201,10 @@ static const uint8_t CHANNELS_24G[] = {
 static const uint8_t CHANNELS_5G[] = {
   36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165
 };
+
+static inline bool scannerIsDfsChannel(uint8_t band, uint8_t channel) {
+  return (band == 5u) && (channel >= 52u) && (channel <= 144u);
+}
 
 // band_index: 0=2.4GHz list, 1=5GHz list.
 // channel_index indexes into the current band's channel array.
@@ -209,9 +233,20 @@ static inline void scannerSetActiveSlot(uint8_t slot) {
 }
 
 #if SCANNER_USE_SHIFTREG_CS
+static inline void scannerShiftRegSetOutputsEnabled(bool enabled) {
+  scanner_shiftreg_outputs_enabled = enabled;
+  // 74HC595 OE is active-low.
+  digitalWrite(SCANNER_SHIFTREG_OE_PIN, enabled ? LOW : HIGH);
+}
+
 static inline void scannerShiftRegWriteCsState(uint8_t state, bool force) {
   if (!force && scanner_cs_shiftreg_state == state) {
     return;
+  }
+  const bool restore_outputs = scanner_shiftreg_outputs_enabled;
+  if (restore_outputs) {
+    // Prevent SPI clocks for shift-register updates from reaching any selected scanner.
+    scannerShiftRegSetOutputsEnabled(false);
   }
   scanner_cs_shiftreg_state = state;
   SPI1.beginTransaction(SPISettings(SCANNER_SHIFTREG_SPI_HZ, MSBFIRST, SPI_MODE0));
@@ -219,6 +254,9 @@ static inline void scannerShiftRegWriteCsState(uint8_t state, bool force) {
   SPI1.endTransaction();
   digitalWrite(SCANNER_SHIFTREG_LATCH_PIN, HIGH);
   digitalWrite(SCANNER_SHIFTREG_LATCH_PIN, LOW);
+  if (restore_outputs) {
+    scannerShiftRegSetOutputsEnabled(true);
+  }
 }
 #endif
 
@@ -266,12 +304,15 @@ static inline void scannerInterframeWait() {
 static bool scannerCommandWithResponse(const uint8_t* cmd_frame,
                                    uint8_t expected_cmd_tag,
                                    uint8_t* response_frame,
-                                   int max_pulls = 8) {
+                                   int max_pulls = 8,
+                                   uint32_t first_pull_wait_us = SCANNER_INTERFRAME_US) {
   uint8_t rx[SCANNER_FRAME_SIZE] = {0};
   uint8_t nop[SCANNER_FRAME_SIZE] = {0};
   nop[0] = CMD_NOP;
   scannerTransferFrame(cmd_frame, rx);
-  scannerInterframeWait();
+  if (first_pull_wait_us > 0) {
+    delayMicroseconds(first_pull_wait_us);
+  }
 
   for (int i = 0; i < max_pulls; i++) {
     scannerTransferFrame(nop, response_frame);
@@ -298,21 +339,27 @@ static void scannerInitBus() {
   pinMode(SCANNER_SHIFTREG_LATCH_PIN, OUTPUT);
   pinMode(SCANNER_SHIFTREG_OE_PIN, OUTPUT);
   digitalWrite(SCANNER_SHIFTREG_LATCH_PIN, LOW);
-  // Active-low OE: disable outputs while shift register state is initialized.
-  digitalWrite(SCANNER_SHIFTREG_OE_PIN, HIGH);
+  // Active-low OE: keep outputs disabled while shift register state is initialized.
+  scannerShiftRegSetOutputsEnabled(false);
 #else
   digitalWrite(SCANNER_PIN_CS, HIGH);
   pinMode(SCANNER_PIN_CS, OUTPUT);
+#endif
+#if SCANNER_MISO_PULLUP
+  gpio_pull_up(SCANNER_PIN_MISO);
 #endif
   SPI1.setSCK(SCANNER_PIN_SCK);
   SPI1.setTX(SCANNER_PIN_MOSI);
   SPI1.setRX(SCANNER_PIN_MISO);
   SPI1.begin();
+#if SCANNER_MISO_PULLUP
+  gpio_pull_up(SCANNER_PIN_MISO);
+#endif
 #if SCANNER_USE_SHIFTREG_CS
   scannerSetActiveSlot(SCANNER_INITIAL_SLOT);
   scannerShiftRegWriteCsState(0xFFu, true);
-  // Enable outputs once all scanner CS lines are safely deasserted.
-  digitalWrite(SCANNER_SHIFTREG_OE_PIN, LOW);
+  // Keep outputs enabled in idle once all scanner CS lines are safely deasserted.
+  scannerShiftRegSetOutputsEnabled(true);
 #endif
 }
 
@@ -346,6 +393,7 @@ static bool ensureScannerSlotIdentity(uint8_t slot, ScannerSlotState& state) {
   DeviceIdReply id = {};
   if (!scannerGetDeviceId(id)) {
     state.id_valid = false;
+    state.next_service_ms = 0;
     state.transport_timeouts = 0;
     state.next_probe_ms = now + SCANNER_SLOT_REPROBE_MS;
     if (!state.miss_logged) {
@@ -364,6 +412,7 @@ static bool ensureScannerSlotIdentity(uint8_t slot, ScannerSlotState& state) {
   const bool max_ok = (id.max_results > 0 && id.max_results <= PROTO_MAX_RESULTS);
   if (!(proto_ok && type_ok && max_ok)) {
     state.id_valid = false;
+    state.next_service_ms = 0;
     state.transport_timeouts = 0;
     state.next_probe_ms = now + SCANNER_SLOT_REPROBE_MS;
     if (!state.unsupported_logged) {
@@ -377,6 +426,7 @@ static bool ensureScannerSlotIdentity(uint8_t slot, ScannerSlotState& state) {
 
   state.id_valid = true;
   state.transport_timeouts = 0;
+  state.next_service_ms = 0;
   state.next_probe_ms = 0;
   state.unsupported_logged = false;
   serialPrintfTry("S%u scanner ready: proto=%u type=%u caps=0x%02X max=%u\n",
@@ -393,13 +443,21 @@ static int8_t scannerQueryStatusWithRetry(uint8_t cmd,
                                           uint8_t retries,
                                           int8_t min_valid_status,
                                           int8_t max_valid_status) {
+  uint8_t pulls = response_pulls;
+  uint32_t first_pull_wait_us = SCANNER_INTERFRAME_US;
+  if (cmd == CMD_SCAN) {
+    const bool dfs = scannerIsDfsChannel(arg1, arg2);
+    pulls = dfs ? SCANNER_SCAN_DFS_RESPONSE_PULLS : response_pulls;
+    first_pull_wait_us = dfs ? SCANNER_SCAN_DFS_FIRST_PULL_US : SCANNER_SCAN_FIRST_PULL_US;
+  }
+
   for (uint8_t attempt = 0; attempt < retries; attempt++) {
     uint8_t tx[SCANNER_FRAME_SIZE] = {0};
     uint8_t rx[SCANNER_FRAME_SIZE] = {0};
     tx[0] = cmd;
     tx[1] = arg1;
     tx[2] = arg2;
-    if (scannerCommandWithResponse(tx, cmd, rx, response_pulls)) {
+    if (scannerCommandWithResponse(tx, cmd, rx, pulls, first_pull_wait_us)) {
       const int8_t status = (int8_t)rx[0];
       if (status >= min_valid_status && status <= max_valid_status) {
         return status;
@@ -419,7 +477,7 @@ static bool scannerGetResult(WiFiResultPacket& pkt) {
   tx[0] = CMD_RESULT_GET;
   nop[0] = CMD_NOP;
 
-  for (int attempt = 0; attempt < SCANNER_QUERY_CMD_RETRIES; attempt++) {
+  for (int attempt = 0; attempt < SCANNER_RESULT_GET_CMD_RETRIES; attempt++) {
     scannerTransferFrame(tx, rx);
     scannerInterframeWait();
 
@@ -521,12 +579,12 @@ static void handleResetButton() {
 }
 
 static void startScanForCurrentChannel(uint8_t slot,
-                                       size_t& band_index,
-                                       size_t& channel_index) {
-  const uint8_t band = (band_index == 0) ? 2 : 5;
-  const uint8_t channel = (band_index == 0)
-    ? CHANNELS_24G[channel_index]
-    : CHANNELS_5G[channel_index];
+                                       size_t& sweep_band_index,
+                                       size_t& sweep_channel_index) {
+  const uint8_t band = (sweep_band_index == 0) ? 2 : 5;
+  const uint8_t channel = (sweep_band_index == 0)
+    ? CHANNELS_24G[sweep_channel_index]
+    : CHANNELS_5G[sweep_channel_index];
 
   const int8_t status = scannerQueryStatusWithRetry(CMD_SCAN,
                                                     band,
@@ -538,7 +596,7 @@ static void startScanForCurrentChannel(uint8_t slot,
   if (status == SCANNER_STATUS_OK) {
     serialPrintfTry("S%u Scan started (band=%u ch=%u)\n",
                     (unsigned)slot, band, channel);
-    advanceSweepChannelAndLog(band_index, channel_index);
+    advanceSweepChannelAndLog(sweep_band_index, sweep_channel_index);
     return;
   }
   if (status == SCANNER_STATUS_BUSY) {
@@ -546,96 +604,125 @@ static void startScanForCurrentChannel(uint8_t slot,
     // and we missed/garbled the ACK. Advance to avoid re-requesting same channel.
     serialPrintfTry("S%u Scan already active (band=%u ch=%u); assuming prior start latched\n",
                     (unsigned)slot, band, channel);
-    advanceSweepChannelAndLog(band_index, channel_index);
+    advanceSweepChannelAndLog(sweep_band_index, sweep_channel_index);
     return;
   }
   if (status == SCANNER_STATUS_TRANSPORT_TIMEOUT) {
     // If SCAN ACK was lost but scanner is now busy, treat scan as started.
-    const int8_t c = scannerQueryStatusWithRetry(CMD_RESULT_COUNT,
-                                                 0,
-                                                 0,
-                                                 SCANNER_RESULT_RESPONSE_PULLS,
-                                                 SCANNER_QUERY_CMD_RETRIES,
-                                                 SCANNER_STATUS_BUSY,
-                                                 static_cast<int8_t>(PROTO_MAX_RESULTS));
-    if (c == SCANNER_STATUS_BUSY) {
-      serialPrintfTry("S%u Scan started (band=%u ch=%u) via BUSY confirm\n",
-                      (unsigned)slot, band, channel);
-      advanceSweepChannelAndLog(band_index, channel_index);
-      return;
+    // DFS start paths can take slightly longer before BUSY is observable.
+    for (uint8_t confirm = 0; confirm < SCANNER_SCAN_BUSY_CONFIRM_POLLS; confirm++) {
+      const int8_t c = scannerQueryStatusWithRetry(CMD_RESULT_COUNT,
+                                                   0,
+                                                   0,
+                                                   SCANNER_RESULT_COUNT_RESPONSE_PULLS,
+                                                   SCANNER_RESULT_COUNT_CMD_RETRIES,
+                                                   SCANNER_STATUS_BUSY,
+                                                   static_cast<int8_t>(PROTO_MAX_RESULTS));
+      if (c == SCANNER_STATUS_BUSY) {
+        serialPrintfTry("S%u Scan started (band=%u ch=%u) via BUSY confirm\n",
+                        (unsigned)slot, band, channel);
+        advanceSweepChannelAndLog(sweep_band_index, sweep_channel_index);
+        return;
+      }
+      if (SCANNER_SCAN_BUSY_CONFIRM_DELAY_US > 0) {
+        delayMicroseconds(SCANNER_SCAN_BUSY_CONFIRM_DELAY_US);
+      }
     }
     // Timeout with no BUSY confirm: move on to avoid getting pinned on one channel.
     serialPrintfTry("S%u SCAN timeout (band=%u ch=%u); moving on\n",
                     (unsigned)slot, band, channel);
-    advanceSweepChannelAndLog(band_index, channel_index);
+    advanceSweepChannelAndLog(sweep_band_index, sweep_channel_index);
     return;
   }
 
   // Unexpected scan status: move on to the next channel.
   serialPrintfTry("S%u SCAN unexpected status=%d (band=%u ch=%u); moving on\n",
                   (unsigned)slot, status, band, channel);
-  advanceSweepChannelAndLog(band_index, channel_index);
+  advanceSweepChannelAndLog(sweep_band_index, sweep_channel_index);
 }
 
-// Per-slot scan pump:
+// Per-slot scan pump with a shared channel scheduler:
 // 1) Poll RESULT_COUNT.
 // 2) If busy -> return.
 // 3) If zero -> request scan on current channel.
 // 4) If >0 -> drain that many packets and enqueue uniques.
 static void processScannerSlot(uint8_t slot,
                                ScannerSlotState& slot_state,
-                               size_t& band_index,
-                               size_t& channel_index) {
+                               size_t& sweep_band_index,
+                               size_t& sweep_channel_index) {
+  const uint32_t now = millis();
+  if ((int32_t)(now - slot_state.next_service_ms) < 0) {
+    return;
+  }
+
   scannerSetActiveSlot(slot);
   const int8_t count = scannerQueryStatusWithRetry(CMD_RESULT_COUNT,
                                                    0,
                                                    0,
-                                                   SCANNER_RESULT_RESPONSE_PULLS,
-                                                   SCANNER_QUERY_CMD_RETRIES,
+                                                   SCANNER_RESULT_COUNT_RESPONSE_PULLS,
+                                                   SCANNER_RESULT_COUNT_CMD_RETRIES,
                                                    SCANNER_STATUS_BUSY,
                                                    static_cast<int8_t>(PROTO_MAX_RESULTS));
 
   // Active scan on slave; poll this slot again next round.
   if (count == SCANNER_STATUS_BUSY) {
     slot_state.transport_timeouts = 0;
+    slot_state.next_service_ms = 0;
     return;
   }
 
   if (count == SCANNER_STATUS_TRANSPORT_TIMEOUT) {
-    if (slot_state.transport_timeouts < 0xFF) {
+    if (slot_state.transport_timeouts < 0x0F) {
       slot_state.transport_timeouts++;
     }
-    if (slot_state.transport_timeouts >= SCANNER_SLOT_TIMEOUT_REPROBE_THRESHOLD) {
-      serialPrintfTry("S%u RESULT_COUNT timeout x%u; draining and continuing\n",
-                      (unsigned)slot, (unsigned)slot_state.transport_timeouts);
-      slot_state.transport_timeouts = 0;
-      scannerDrainStaleFrames(4);
+    const uint8_t streak = slot_state.transport_timeouts;
+    const uint8_t shift = (streak <= 1) ? 0 : ((streak >= 5) ? 4 : (uint8_t)(streak - 1));
+    uint32_t backoff_ms = (uint32_t)SCANNER_SLOT_TIMEOUT_BACKOFF_BASE_MS << shift;
+    if (backoff_ms > SCANNER_SLOT_TIMEOUT_BACKOFF_MAX_MS) {
+      backoff_ms = SCANNER_SLOT_TIMEOUT_BACKOFF_MAX_MS;
+    }
+    slot_state.next_service_ms = now + backoff_ms;
+
+    if ((streak == SCANNER_SLOT_TIMEOUT_REPROBE_THRESHOLD) ||
+        ((streak % SCANNER_SLOT_TIMEOUT_REPROBE_THRESHOLD) == 0)) {
+      serialPrintfTry("S%u RESULT_COUNT timeout x%u; backing off %lums\n",
+                      (unsigned)slot,
+                      (unsigned)streak,
+                      (unsigned long)backoff_ms);
     }
     return;
   }
   slot_state.transport_timeouts = 0;
+  slot_state.next_service_ms = 0;
 
   if (count < 0) {
-    // Unexpected status: move this slot's channel pointer.
+    // Unexpected status: advance global scheduler so one bad slot does not stall coverage.
     serialPrintfTry("S%u RESULT_COUNT unexpected=%d; moving on\n",
                     (unsigned)slot, count);
-    advanceSweepChannelAndLog(band_index, channel_index);
+    advanceSweepChannelAndLog(sweep_band_index, sweep_channel_index);
     return;
   }
 
-  // No results pending: request next scan for this slot.
+  // No results pending: request next scan from the global scheduler.
   if (count == 0) {
-    startScanForCurrentChannel(slot, band_index, channel_index);
+    startScanForCurrentChannel(slot, sweep_band_index, sweep_channel_index);
     return;
   }
 
   // Results pending: drain up to reported count for this slot.
   bool scanner_busy_during_drain = false;
+  const int drain_budget = (count > (int)SCANNER_RESULT_DRAIN_BUDGET)
+    ? (int)SCANNER_RESULT_DRAIN_BUDGET
+    : count;
   uint16_t batch_dedupe_hits = 0;
   uint16_t batch_dedupe_logs = 0;
-  for (int i = 0; i < count; i++) {
+  for (int i = 0; i < drain_budget; i++) {
     WiFiResultPacket pkt = {};
     if (!scannerGetResult(pkt)) {
+      if (slot_state.transport_timeouts < 0x0F) {
+        slot_state.transport_timeouts++;
+      }
+      slot_state.next_service_ms = now + SCANNER_SLOT_TIMEOUT_BACKOFF_BASE_MS;
       break;
     }
 
@@ -754,8 +841,8 @@ static void printPeriodicStatus(bool usable_fix) {
 
 void loop2() {
   static ScannerSlotState slot_state[SCANNER_SLOT_COUNT] = {};
-  static size_t band_index[SCANNER_SLOT_COUNT] = {};
-  static size_t channel_index[SCANNER_SLOT_COUNT] = {};
+  static size_t sweep_band_index = 0;
+  static size_t sweep_channel_index = 0;
   static uint8_t slot = SCANNER_INITIAL_SLOT;
 
   serialPrintlnTry("Core1 SPI loop started");
@@ -773,7 +860,7 @@ void loop2() {
     // Each iteration services exactly one slot; round-robin when shift-reg CS is enabled.
     scannerSetActiveSlot(slot);
     if (ensureScannerSlotIdentity(slot, slot_state[slot])) {
-      processScannerSlot(slot, slot_state[slot], band_index[slot], channel_index[slot]);
+      processScannerSlot(slot, slot_state[slot], sweep_band_index, sweep_channel_index);
     }
 #if SCANNER_USE_SHIFTREG_CS
     slot = (uint8_t)((slot + 1u) % SCANNER_SLOT_COUNT);
@@ -857,6 +944,9 @@ void setup() {
                 (unsigned)SCANNER_SLOT_COUNT);
 #else
   Serial.println("SPI1 initialized.");
+#endif
+#if SCANNER_MISO_PULLUP
+  Serial.println("Scanner MISO internal pull-up enabled");
 #endif
   // Initialize GNSS UART
   GNSS_UART.setTX(GNSS_TX);

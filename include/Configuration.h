@@ -35,6 +35,17 @@
 #define ESP_PIN_MISO 12  // SPI1 MISO line from scanner module.
 #endif
 
+// Scanner SPI bus clock in Hz (Pico master <-> scanner slaves).
+#ifndef SCANNER_SPI_CLOCK
+#define SCANNER_SPI_CLOCK 20000000  // Conservative default for multi-drop scanner wiring.
+#endif
+
+// Enable RP2040 internal pull-up on scanner MISO to keep idle bus high
+// when all scanner slaves are deasserted/tri-stated.
+#ifndef SCANNER_MISO_PULLUP
+#define SCANNER_MISO_PULLUP 1  // 1 enables internal pull-up on scanner MISO.
+#endif
+
 // Scanner CS wiring mode: 0 = direct GPIO CS, 1 = 74HC595 shift-register CS.
 #ifndef SCANNER_USE_SHIFTREG_CS
 #define SCANNER_USE_SHIFTREG_CS 0  // 0: direct CS pin, 1: shift-register CS.
@@ -55,12 +66,12 @@
 #define SCANNER_SHIFTREG_OE_PIN 16  // 74HC595 output-enable pin (active low).
 #endif
 #ifndef SCANNER_SHIFTREG_SPI_HZ
-#define SCANNER_SHIFTREG_SPI_HZ 2000000  // Shift-register SPI clock in Hz.
+#define SCANNER_SHIFTREG_SPI_HZ 1000000  // Shift-register SPI clock in Hz.
 #endif
 
 // Number of active-low CS outputs driven by the shift register.
 #ifndef SCANNER_SHIFTREG_OUTPUTS
-#define SCANNER_SHIFTREG_OUTPUTS 8  // Number of usable CS outputs (1..8).
+#define SCANNER_SHIFTREG_OUTPUTS 6  // Number of usable CS outputs (1..8).
 #endif
 #if SCANNER_SHIFTREG_OUTPUTS < 1 || SCANNER_SHIFTREG_OUTPUTS > 8
 #error "SCANNER_SHIFTREG_OUTPUTS must be in [1,8]"
