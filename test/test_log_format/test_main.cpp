@@ -2,7 +2,7 @@
 
 #include <unity.h>
 
-#include "pico_logging_format.h"
+#include "log_format.h"
 #include "spi_protocol_shared.h"
 
 void setUp() {}
@@ -123,3 +123,4 @@ int main(int argc, char** argv) {
   RUN_TEST(test_buildCsvWifiRow_reports_overflow);
   return UNITY_END();
 }
+
