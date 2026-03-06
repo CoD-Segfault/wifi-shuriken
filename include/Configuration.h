@@ -62,13 +62,6 @@
 #define SCANNER_USE_SHIFTREG_CS 1  // XIAO RP2350 default: shift-register CS.
 #endif
 
-// Direct GPIO CS pin when shift-register CS mode is disabled.
-#if !SCANNER_USE_SHIFTREG_CS
-#ifndef ESP_PIN_CS
-#define ESP_PIN_CS 13  // Direct scanner chip-select pin.
-#endif
-#endif
-
 // Shift-register control pins and SPI speed when SCANNER_USE_SHIFTREG_CS is enabled.
 #ifndef SCANNER_SHIFTREG_LATCH_PIN
 #define SCANNER_SHIFTREG_LATCH_PIN 26  // XIAO RP2350 D0: 74HC595 latch (RCLK).
@@ -78,6 +71,13 @@
 #endif
 #ifndef SCANNER_SHIFTREG_SPI_HZ
 #define SCANNER_SHIFTREG_SPI_HZ 1000000  // Shift-register SPI clock in Hz.
+#endif
+
+// Reuse shift-register OE for CS if only one scanner connected.
+#if !SCANNER_USE_SHIFTREG_CS
+#ifndef ESP_PIN_CS
+#define ESP_PIN_CS SCANNER_SHIFTREG_OE_PIN
+#endif
 #endif
 
 // Number of active-low CS outputs driven by the shift register.
