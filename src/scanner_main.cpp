@@ -209,6 +209,12 @@ static inline void abortScanAndSetIdle() {
   setScanEngineIdle();
 }
 
+static void resetDedupeAndBuffers() {
+  abortScanAndSetIdle();
+  wifiDedupeTableReset(&scan_dedupe_table);
+  last_scan_status = SCANNER_STATUS_OK;
+}
+
 static void write_status_response(int8_t value) {
   memcpy(tx_buf, &value, 1);
 }
@@ -452,9 +458,17 @@ static void handleCmdResultGet() {
 }
 
 static void handleCmdDedupeReset() {
-  // Keep slave dedupe reset boot-only.
-  write_status_response(0);
-  DBG_PRINTLN("[SPI] rsp DEDUPE_RESET => ignored");
+  // Reset is allowed only when not actively scanning/processing.
+  update_scan_state();
+  if (scan_phase != ScanPhase::Idle) {
+    write_status_response(SCANNER_STATUS_BUSY);
+    DBG_PRINTLN("[SPI] rsp DEDUPE_RESET => BUSY");
+    return;
+  }
+
+  resetDedupeAndBuffers();
+  write_status_response(SCANNER_STATUS_OK);
+  DBG_PRINTLN("[SPI] rsp DEDUPE_RESET => OK");
 }
 
 // ---------- Command handling ----------
@@ -513,7 +527,7 @@ void setup() {
   memset(rx_buf, 0, FRAME_SIZE);
   memset(tx_buf, 0, FRAME_SIZE);
   wifiDedupeTableInit(&scan_dedupe_table, scan_dedupe_storage, WIFI_DEDUPE_TABLE_CAPACITY);
-  wifiDedupeTableReset(&scan_dedupe_table);
+  resetDedupeAndBuffers();
 
   // Boot complete: scanner is ready/idle.
   scannerStatusLedSet(false);
