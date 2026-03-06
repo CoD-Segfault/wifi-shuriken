@@ -10,11 +10,67 @@
 #include <sys/time.h>
 #include <time.h>
 
+#if defined(__has_include)
+#if __has_include(<pico/unique_id.h>)
+#include <pico/unique_id.h>
+#define PICO_LOGGING_HAS_UNIQUE_ID 1
+#else
+#define PICO_LOGGING_HAS_UNIQUE_ID 0
+#endif
+#else
+#define PICO_LOGGING_HAS_UNIQUE_ID 0
+#endif
+
 namespace pico_logging {
 namespace {
 
 // Some GNSS modules emit 2080+ placeholder dates before RTC/fix is valid.
 static constexpr uint16_t GNSS_INVALID_RTC_YEAR_FLOOR = 2080;
+static constexpr size_t PICO_UID_HEX_BYTES = 8;
+
+void appendUidToValue(const char* base, const char* suffix, char* out, size_t out_len) {
+  if (!out || out_len == 0) {
+    return;
+  }
+
+  const char* base_value = (base != nullptr) ? base : "";
+  if (suffix != nullptr && suffix[0] != '\0') {
+    (void)snprintf(out, out_len, "%s-%s", base_value, suffix);
+  } else {
+    (void)snprintf(out, out_len, "%s", base_value);
+  }
+}
+
+void getBoardUidHex(char* out, size_t out_len) {
+  if (!out || out_len == 0) {
+    return;
+  }
+  out[0] = '\0';
+
+#if PICO_LOGGING_HAS_UNIQUE_ID
+  pico_unique_board_id_t uid = {};
+  pico_get_unique_board_id(&uid);
+
+  uint8_t uid_bytes[PICO_UID_HEX_BYTES] = {};
+  const size_t uid_size = sizeof(uid);
+  const size_t copy_bytes = (uid_size < PICO_UID_HEX_BYTES) ? uid_size : PICO_UID_HEX_BYTES;
+  memcpy(uid_bytes, &uid, copy_bytes);
+
+  if (out_len <= (PICO_UID_HEX_BYTES * 2)) {
+    return;
+  }
+  size_t pos = 0;
+  for (size_t i = 0; i < copy_bytes; i++) {
+    const int written = snprintf(out + pos, out_len - pos, "%02X", uid_bytes[i]);
+    if (written < 0) {
+      out[0] = '\0';
+      return;
+    }
+    pos += static_cast<size_t>(written);
+  }
+  out[pos] = '\0';
+#endif
+}
 
 }  // namespace
 
@@ -349,10 +405,23 @@ bool Logger::initCsvLog(const char* path) {
   if (!log_file_) return false;
 
   if (!exists || log_file_.size() == 0) {
-    log_file_.println(
-        "WigleWifi-1.4,appRelease=" APP_RELEASE_VERSION
-        ",model=WiFi-Shuriken,release=" RELEASE_VERSION
-        ",device=WiFi-Shuriken,display=none,board=WiFi-Shuriken,brand=CoD_Segfault");
+    char board_uid[PICO_UID_HEX_BYTES * 2 + 1] = {};
+    char app_release_with_uid[64] = {};
+    char release_with_uid[64] = {};
+
+    getBoardUidHex(board_uid, sizeof(board_uid));
+
+    appendUidToValue(APP_RELEASE_VERSION, board_uid, app_release_with_uid, sizeof(app_release_with_uid));
+    appendUidToValue(RELEASE_VERSION, board_uid, release_with_uid, sizeof(release_with_uid));
+
+    char header[256] = {};
+    (void)snprintf(
+        header,
+        sizeof(header),
+        "WigleWifi-1.4,appRelease=%s,model=WiFi-Shuriken,release=%s,device=WiFi-Shuriken,display=none,board=WiFi-Shuriken,brand=CoD_Segfault",
+        app_release_with_uid,
+        release_with_uid);
+    log_file_.println(header);
     log_file_.println("MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type");
     log_file_.flush();
   }
