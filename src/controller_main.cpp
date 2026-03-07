@@ -44,6 +44,8 @@ static queue_t serial_msg_queue;
 static uint32_t scan_queue_drops = 0;
 static uint32_t serial_msg_drops = 0;
 static uint32_t dedupe_drops = 0;
+static volatile uint32_t sweep_cycles_completed = 0;
+static volatile uint32_t last_full_sweep_ms = 0;
 static constexpr uint16_t GPS_FIELD_MAX_AGE_MS = 3000;
 
 static constexpr uint16_t MASTER_DEDUPE_CAPACITY = WIFI_DEDUPE_TABLE_CAPACITY;
@@ -253,6 +255,16 @@ static bool advanceSweepChannel(size_t& band_index, size_t& channel_index) {
   return false;
 }
 
+static inline void sweepTimingNoteStart(size_t band_index,
+                                        size_t channel_index,
+                                        bool& timing_active,
+                                        uint32_t& started_ms) {
+  if (!timing_active && band_index == 0 && channel_index == 0) {
+    started_ms = millis();
+    timing_active = true;
+  }
+}
+
 static inline void scannerSetActiveSlot(uint8_t slot) {
 #if SCANNER_USE_SHIFTREG_CS
   scanner_active_slot = (uint8_t)(slot % SCANNER_SLOT_COUNT);
@@ -290,8 +302,20 @@ static inline void scannerShiftRegWriteCsState(uint8_t state, bool force) {
 }
 #endif
 
-static inline void advanceSweepChannelAndLog(size_t& band_index, size_t& channel_index) {
+static inline void advanceSweepChannelAndLog(size_t& band_index,
+                                             size_t& channel_index,
+                                             bool& timing_active,
+                                             uint32_t& started_ms) {
   if (advanceSweepChannel(band_index, channel_index)) {
+    if (timing_active) {
+      const uint32_t elapsed_ms = millis() - started_ms;
+      last_full_sweep_ms = elapsed_ms;
+      sweep_cycles_completed++;
+      serialPrintfTry("Completed full 2.4G + 5G sweep in %lums\n",
+                      (unsigned long)elapsed_ms);
+      timing_active = false;
+      return;
+    }
     serialPrintlnTry("Completed full 2.4G + 5G sweep");
   }
 }
@@ -613,11 +637,17 @@ static void handleResetButton() {
 
 static void startScanForCurrentChannel(uint8_t slot,
                                        size_t& sweep_band_index,
-                                       size_t& sweep_channel_index) {
+                                       size_t& sweep_channel_index,
+                                       bool& sweep_timing_active,
+                                       uint32_t& sweep_started_ms) {
   const uint8_t band = (sweep_band_index == 0) ? 2 : 5;
   const uint8_t channel = (sweep_band_index == 0)
     ? CHANNELS_24G[sweep_channel_index]
     : CHANNELS_5G[sweep_channel_index];
+  sweepTimingNoteStart(sweep_band_index,
+                       sweep_channel_index,
+                       sweep_timing_active,
+                       sweep_started_ms);
 
   const int8_t status = scannerQueryStatusWithRetry(CMD_SCAN,
                                                     band,
@@ -629,7 +659,10 @@ static void startScanForCurrentChannel(uint8_t slot,
   if (status == SCANNER_STATUS_OK) {
     serialPrintfTry("S%u Scan started (band=%u ch=%u)\n",
                     (unsigned)slot, band, channel);
-    advanceSweepChannelAndLog(sweep_band_index, sweep_channel_index);
+    advanceSweepChannelAndLog(sweep_band_index,
+                              sweep_channel_index,
+                              sweep_timing_active,
+                              sweep_started_ms);
     return;
   }
   if (status == SCANNER_STATUS_BUSY) {
@@ -637,7 +670,10 @@ static void startScanForCurrentChannel(uint8_t slot,
     // and we missed/garbled the ACK. Advance to avoid re-requesting same channel.
     serialPrintfTry("S%u Scan already active (band=%u ch=%u); assuming prior start latched\n",
                     (unsigned)slot, band, channel);
-    advanceSweepChannelAndLog(sweep_band_index, sweep_channel_index);
+    advanceSweepChannelAndLog(sweep_band_index,
+                              sweep_channel_index,
+                              sweep_timing_active,
+                              sweep_started_ms);
     return;
   }
   if (status == SCANNER_STATUS_TRANSPORT_TIMEOUT) {
@@ -653,7 +689,10 @@ static void startScanForCurrentChannel(uint8_t slot,
       if (c == SCANNER_STATUS_BUSY) {
         serialPrintfTry("S%u Scan started (band=%u ch=%u) via BUSY confirm\n",
                         (unsigned)slot, band, channel);
-        advanceSweepChannelAndLog(sweep_band_index, sweep_channel_index);
+        advanceSweepChannelAndLog(sweep_band_index,
+                                  sweep_channel_index,
+                                  sweep_timing_active,
+                                  sweep_started_ms);
         return;
       }
       if (SCANNER_SCAN_BUSY_CONFIRM_DELAY_US > 0) {
@@ -663,14 +702,20 @@ static void startScanForCurrentChannel(uint8_t slot,
     // Timeout with no BUSY confirm: move on to avoid getting pinned on one channel.
     serialPrintfTry("S%u SCAN timeout (band=%u ch=%u); moving on\n",
                     (unsigned)slot, band, channel);
-    advanceSweepChannelAndLog(sweep_band_index, sweep_channel_index);
+    advanceSweepChannelAndLog(sweep_band_index,
+                              sweep_channel_index,
+                              sweep_timing_active,
+                              sweep_started_ms);
     return;
   }
 
   // Unexpected scan status: move on to the next channel.
   serialPrintfTry("S%u SCAN unexpected status=%d (band=%u ch=%u); moving on\n",
                   (unsigned)slot, status, band, channel);
-  advanceSweepChannelAndLog(sweep_band_index, sweep_channel_index);
+  advanceSweepChannelAndLog(sweep_band_index,
+                            sweep_channel_index,
+                            sweep_timing_active,
+                            sweep_started_ms);
 }
 
 // Per-slot scan pump with a shared channel scheduler:
@@ -681,7 +726,9 @@ static void startScanForCurrentChannel(uint8_t slot,
 static void processScannerSlot(uint8_t slot,
                                ScannerSlotState& slot_state,
                                size_t& sweep_band_index,
-                               size_t& sweep_channel_index) {
+                               size_t& sweep_channel_index,
+                               bool& sweep_timing_active,
+                               uint32_t& sweep_started_ms) {
   const uint32_t now = millis();
   if ((int32_t)(now - slot_state.next_service_ms) < 0) {
     return;
@@ -761,13 +808,20 @@ static void processScannerSlot(uint8_t slot,
     // Unexpected status: advance global scheduler so one bad slot does not stall coverage.
     serialPrintfTry("S%u RESULT_COUNT unexpected=%d; moving on\n",
                     (unsigned)slot, count);
-    advanceSweepChannelAndLog(sweep_band_index, sweep_channel_index);
+    advanceSweepChannelAndLog(sweep_band_index,
+                              sweep_channel_index,
+                              sweep_timing_active,
+                              sweep_started_ms);
     return;
   }
 
   // No results pending: request next scan from the global scheduler.
   if (count == 0) {
-    startScanForCurrentChannel(slot, sweep_band_index, sweep_channel_index);
+    startScanForCurrentChannel(slot,
+                               sweep_band_index,
+                               sweep_channel_index,
+                               sweep_timing_active,
+                               sweep_started_ms);
     return;
   }
 
@@ -867,12 +921,14 @@ static void processScannerSlot(uint8_t slot,
 }
 
 static void serialPrintRuntimeStatus() {
-  serialPrintfNormalized("Queue drops=%lu serial_drop=%lu dedupe_drop=%lu logged=%lu blank_gps=%lu\n",
+  serialPrintfNormalized("Queue drops=%lu serial_drop=%lu dedupe_drop=%lu logged=%lu blank_gps=%lu sweeps=%lu last_sweep_ms=%lu\n",
                          (unsigned long)scan_queue_drops,
                          (unsigned long)serial_msg_drops,
                          (unsigned long)dedupe_drops,
                          (unsigned long)logging_state.csv_rows,
-                         (unsigned long)logging_state.csv_rows_blank_gps);
+                         (unsigned long)logging_state.csv_rows_blank_gps,
+                         (unsigned long)sweep_cycles_completed,
+                         (unsigned long)last_full_sweep_ms);
 }
 
 static void serialPrintGpsStatus(bool usable_fix) {
@@ -905,6 +961,8 @@ void loop2() {
   static ScannerSlotState slot_state[SCANNER_SLOT_COUNT] = {};
   static size_t sweep_band_index = 0;
   static size_t sweep_channel_index = 0;
+  static bool sweep_timing_active = false;
+  static uint32_t sweep_started_ms = 0;
   static uint8_t slot = SCANNER_INITIAL_SLOT;
 
   serialPrintlnTry("Core1 SPI loop started");
@@ -922,7 +980,12 @@ void loop2() {
     // Each iteration services exactly one slot; round-robin when shift-reg CS is enabled.
     scannerSetActiveSlot(slot);
     if (ensureScannerSlotIdentity(slot, slot_state[slot])) {
-      processScannerSlot(slot, slot_state[slot], sweep_band_index, sweep_channel_index);
+      processScannerSlot(slot,
+                         slot_state[slot],
+                         sweep_band_index,
+                         sweep_channel_index,
+                         sweep_timing_active,
+                         sweep_started_ms);
     }
 #if SCANNER_USE_SHIFTREG_CS
     slot = (uint8_t)((slot + 1u) % SCANNER_SLOT_COUNT);

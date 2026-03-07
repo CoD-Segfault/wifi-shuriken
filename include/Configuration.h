@@ -146,7 +146,7 @@
 
 // SPI delay between command and follow-up polling frame in microseconds.
 #ifndef ESP_INTERFRAME_US
-#define ESP_INTERFRAME_US 100  // Delay between SPI command and response pulls.
+#define ESP_INTERFRAME_US 10  // Delay between SPI command and response pulls.
 #endif
 
 #if defined(USE_TINYUSB)
