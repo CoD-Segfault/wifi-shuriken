@@ -12,8 +12,13 @@
 #include "wifi_result_utils.h"
 #include "Configuration.h"
 
+// This module owns the controller-side scanner transport and scheduler that run
+// on core1: SPI framing, slot identification, shared sweep progression, and
+// controller-wide dedupe before results are handed back to core0.
+
 using QueuedScanResult = pico_logging::QueuedScanResult;
 
+// Transport tuning constants for the Pico<->scanner SPI protocol.
 static constexpr size_t SCANNER_FRAME_SIZE = SPI_FRAME_SIZE;
 static constexpr uint32_t SCANNER_SPI_HZ = SCANNER_SPI_CLOCK;
 static constexpr size_t SCANNER_FRAME_TAG_INDEX = SPI_FRAME_TAG_INDEX;
@@ -80,6 +85,8 @@ static const uint8_t CHANNELS_5G[] = {
   36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165
 };
 
+// Persistent core1 runtime state. controller_main.cpp owns the shared queues and
+// counters, but the scanner runtime owns the active slot machine and sweep state.
 static ControllerScannerRuntimeContext scanner_runtime_context = {};
 static uint8_t scanner_cs_shiftreg_state = 0xFF;
 static uint8_t scanner_active_slot = SCANNER_INITIAL_SLOT;
@@ -87,6 +94,7 @@ static uint8_t scanner_active_slot = SCANNER_INITIAL_SLOT;
 static bool scanner_shiftreg_outputs_enabled = false;
 #endif
 static ScannerSlotState scanner_slot_state[SCANNER_SLOT_COUNT] = {};
+// A single global sweep order is shared across all scanner slots.
 static size_t scanner_sweep_band_index = 0;
 static size_t scanner_sweep_channel_index = 0;
 static bool scanner_sweep_timing_active = false;
@@ -141,6 +149,7 @@ static bool advanceSweepChannel(size_t& band_index, size_t& channel_index) {
   return false;
 }
 
+// Sweep timing starts when the shared scheduler wraps to channel 1 on 2.4GHz.
 static inline void sweepTimingNoteStart(size_t band_index,
                                         size_t channel_index,
                                         bool& timing_active,
@@ -153,6 +162,8 @@ static inline void sweepTimingNoteStart(size_t band_index,
 
 static inline void scannerSetActiveSlot(uint8_t slot) {
 #if SCANNER_USE_SHIFTREG_CS
+  // The active slot selects which 74HC595 output will assert CS for the next
+  // transfer. With direct CS wiring there is only one logical slot.
   scanner_active_slot = (uint8_t)(slot % SCANNER_SLOT_COUNT);
 #else
   (void)slot;
@@ -168,6 +179,8 @@ static inline void scannerShiftRegSetOutputsEnabled(bool enabled) {
 }
 
 static inline void scannerShiftRegWriteCsState(uint8_t state, bool force) {
+  // Updating the shift register itself uses SPI1, so temporarily disable the
+  // scanner outputs to avoid clocking garbage into a selected slave.
   if (!force && scanner_cs_shiftreg_state == state) {
     return;
   }
@@ -192,6 +205,9 @@ static inline void advanceSweepChannelAndLog(size_t& band_index,
                                              size_t& channel_index,
                                              bool& timing_active,
                                              uint32_t& started_ms) {
+  // The scheduler is global across all slots, so sweep completion is only
+  // recognized when the shared channel cursor wraps from the end of 5GHz back
+  // to the start of 2.4GHz.
   if (advanceSweepChannel(band_index, channel_index)) {
     if (timing_active) {
       const uint32_t elapsed_ms = millis() - started_ms;
@@ -216,6 +232,8 @@ static void scannerTransferFrame(const uint8_t* tx, uint8_t* rx) {
 #endif
   SPI1.beginTransaction(SPISettings(SCANNER_SPI_HZ, MSBFIRST, SPI_MODE0));
 
+  // The slave protocol is fixed-length and full-duplex, so every command and
+  // poll is exactly one 64-byte transfer.
   for (size_t i = 0; i < SCANNER_FRAME_SIZE; i++) {
     const uint8_t t = tx ? tx[i] : 0;
     const uint8_t r = SPI1.transfer(t);
@@ -235,6 +253,8 @@ static void scannerTransferFrame(const uint8_t* tx, uint8_t* rx) {
 }
 
 static inline void scannerInterframeWait() {
+  // Some scanner boards need a short turnaround gap between command and poll
+  // frames to let the response buffer settle.
   if (SCANNER_INTERFRAME_US > 0) {
     delayMicroseconds(SCANNER_INTERFRAME_US);
   }
@@ -246,6 +266,8 @@ static bool scannerCommandWithResponse(const uint8_t* cmd_frame,
                                        uint8_t* response_frame,
                                        int max_pulls = 8,
                                        uint32_t first_pull_wait_us = SCANNER_INTERFRAME_US) {
+  // Most commands are acknowledged asynchronously: send once, then keep pulling
+  // NOP frames until the scanner echoes the expected command tag.
   uint8_t rx[SCANNER_FRAME_SIZE] = {0};
   uint8_t nop[SCANNER_FRAME_SIZE] = {0};
   nop[0] = CMD_NOP;
@@ -265,6 +287,8 @@ static bool scannerCommandWithResponse(const uint8_t* cmd_frame,
 }
 
 static void scannerDrainStaleFrames(int pulls = 4) {
+  // Drain leftover reply frames when we switch slots or recover from malformed
+  // traffic so a stale response is less likely to be mis-read as the next ACK.
   uint8_t nop[SCANNER_FRAME_SIZE] = {0};
   uint8_t rx[SCANNER_FRAME_SIZE] = {0};
   nop[0] = CMD_NOP;
@@ -275,6 +299,7 @@ static void scannerDrainStaleFrames(int pulls = 4) {
 }
 
 void controllerScannerRuntimeInitBus() {
+  // Bring the scanner bus to a safe idle state before core1 starts polling.
 #if SCANNER_USE_SHIFTREG_CS
   pinMode(SCANNER_SHIFTREG_LATCH_PIN, OUTPUT);
   pinMode(SCANNER_SHIFTREG_OE_PIN, OUTPUT);
@@ -307,6 +332,8 @@ static bool scannerGetDeviceId(DeviceIdReply& out) {
   uint8_t tx[SCANNER_FRAME_SIZE] = {0};
   uint8_t rx[SCANNER_FRAME_SIZE] = {0};
 
+  // Empty or still-booting slots can return garbage; probe a few times before
+  // deciding the slot is absent.
   for (int attempt = 0; attempt < 8; attempt++) {
     tx[0] = CMD_ID;
     if (scannerCommandWithResponse(tx, CMD_ID, rx, 10)) {
@@ -321,6 +348,8 @@ static bool scannerGetDeviceId(DeviceIdReply& out) {
 }
 
 static bool ensureScannerSlotIdentity(uint8_t slot, ScannerSlotState& state) {
+  // Slot identity is cached until transport failures force a re-probe. This
+  // keeps empty slots from consuming controller bandwidth every pass.
   if (state.id_valid) {
     return true;
   }
@@ -389,6 +418,8 @@ static int8_t scannerQueryStatusWithRetry(uint8_t cmd,
                                           uint8_t retries,
                                           int8_t min_valid_status,
                                           int8_t max_valid_status) {
+  // SCAN needs a longer first wait than lightweight status commands because
+  // the scanner must hand work to the Wi-Fi driver before an ACK is ready.
   uint32_t first_pull_wait_us = SCANNER_INTERFRAME_US;
   if (cmd == CMD_SCAN) {
     first_pull_wait_us = SCANNER_SCAN_FIRST_PULL_US;
@@ -414,6 +445,8 @@ static int8_t scannerQueryStatusWithRetry(uint8_t cmd,
 }
 
 static bool scannerGetResult(WiFiResultPacket& pkt) {
+  // RESULT_GET is a two-phase exchange: request the next packet, then keep
+  // pulling until the scanner returns a tagged result payload.
   uint8_t tx[SCANNER_FRAME_SIZE] = {0};
   uint8_t rx[SCANNER_FRAME_SIZE] = {0};
   uint8_t nop[SCANNER_FRAME_SIZE] = {0};
@@ -454,6 +487,8 @@ static void startScanForCurrentChannel(uint8_t slot,
                                        size_t& sweep_channel_index,
                                        bool& sweep_timing_active,
                                        uint32_t& sweep_started_ms) {
+  // Every slot draws work from the same shared channel cursor. A slot that
+  // successfully starts a scan advances the global sweep for the next slot.
   const uint8_t band = (sweep_band_index == 0) ? 2 : 5;
   const uint8_t channel = (sweep_band_index == 0)
     ? CHANNELS_24G[sweep_channel_index]
@@ -545,6 +580,8 @@ static void processScannerSlot(uint8_t slot,
                                size_t& sweep_channel_index,
                                bool& sweep_timing_active,
                                uint32_t& sweep_started_ms) {
+  // Each service pass handles one slot only. This keeps the round-robin fair
+  // across populated scanners even when one slot has a large result backlog.
   const uint32_t now = millis();
   if ((int32_t)(now - slot_state.next_service_ms) < 0) {
     return;
@@ -553,6 +590,8 @@ static void processScannerSlot(uint8_t slot,
   scannerSetActiveSlot(slot);
 
   if (!slot_state.dedupe_reset_done) {
+    // Reset scanner-local dedupe once per identification cycle so the slave
+    // starts each attach with a clean buffer model.
     if ((int32_t)(now - slot_state.next_dedupe_reset_ms) < 0) {
       return;
     }
@@ -675,6 +714,8 @@ static void processScannerSlot(uint8_t slot,
 
       WiFiDedupeHash hash = {};
       wifiDedupeHashFromResult(pkt.result, hash);
+      // Controller-side dedupe suppresses duplicates across all scanners, not
+      // just within the reporting slot.
       if (!wifiDedupeTableRemember(scanner_runtime_context.master_dedupe_table, &hash)) {
         (*scanner_runtime_context.dedupe_drops)++;
         batch_dedupe_hits++;
@@ -739,6 +780,8 @@ static void processScannerSlot(uint8_t slot,
 }
 
 void controllerScannerRuntimeRun(const ControllerScannerRuntimeContext& context) {
+  // core1 lives here forever after startup. controller_main.cpp only builds the
+  // context and launches this loop on the second core.
   scanner_runtime_context = context;
   scanner_slot = SCANNER_INITIAL_SLOT;
 

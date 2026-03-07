@@ -11,13 +11,19 @@
 
 #include "Configuration.h"
 
+// This module owns controller-side GNSS plumbing: UART bring-up, PMTK setup,
+// raw NMEA passthrough, TinyGPS++ feeding, and the GPS fix LED.
+
 #if defined(USE_TINYUSB)
+// Secondary CDC interface used exclusively for raw NMEA passthrough.
 static Adafruit_USBD_CDC nmea_passthrough_cdc;
 static constexpr uint8_t NMEA_PASSTHROUGH_CDC_INSTANCE = 1;
 #endif
 
 void controllerGnssRuntimeInitUsbPassthrough() {
 #if defined(USE_TINYUSB)
+  // Reattach after begin() so descriptor changes applied in setup() are visible
+  // on hosts that enumerate immediately.
   nmea_passthrough_cdc.begin(115200);
   if (TinyUSBDevice.mounted()) {
     TinyUSBDevice.detach();
@@ -66,6 +72,8 @@ void controllerGnssRuntimeSendPMTKCommand(const char* cmd) {
 
 static void gnssUartBeginWithConfiguredBuffer(uint32_t baud) {
   static bool fifo_warned = false;
+  // The Arduino-Pico FIFO resize can fail on some targets; warn once and keep
+  // going with the default buffer instead of spamming the console.
   if (!GNSS_UART.setFIFOSize(SERIAL_BUFFER_SIZE) && !fifo_warned) {
     Serial.print("Warning: GNSS UART FIFO resize failed, keeping default. requested=");
     Serial.println((unsigned)SERIAL_BUFFER_SIZE);
@@ -77,6 +85,8 @@ static void gnssUartBeginWithConfiguredBuffer(uint32_t baud) {
 static void configureGnssBaudToTarget() {
   static const uint32_t probe_bauds[] = {115200, 9600, 38400};
 
+  // Some modules may already be at the target rate while others still power up
+  // at older defaults. Probe the common cases and always finish at the target.
   // Try the baud-rate switch command at common existing rates so legacy and
   // newer modules both converge to CONTROLLER_GNSS_TARGET_BAUD.
   for (size_t i = 0; i < (sizeof(probe_bauds) / sizeof(probe_bauds[0])); i++) {
@@ -106,6 +116,8 @@ void controllerGnssRuntimeInitUart() {
 bool controllerGnssRuntimeService(TinyGPSPlus& gps,
                                   Adafruit_NeoPixel& pixels,
                                   uint16_t gps_field_max_age_ms) {
+  // Keep the GNSS UART drained aggressively so TinyGPS++ parsing and optional
+  // NMEA mirroring do not fall behind while core0 is also handling SD writes.
   while (GNSS_UART.available()) {
     char c = GNSS_UART.read();
     gps.encode(c);
@@ -115,6 +127,8 @@ bool controllerGnssRuntimeService(TinyGPSPlus& gps,
 #endif
   }
 
+  // The controller only considers a fix usable when location is fresh and at
+  // least a minimal satellite lock is present.
   const bool usable_fix =
       gps.location.isValid() &&
       gps.location.age() < gps_field_max_age_ms &&
@@ -127,6 +141,8 @@ bool controllerGnssRuntimeService(TinyGPSPlus& gps,
 void controllerGnssRuntimeSerialPrintStatus(TinyGPSPlus& gps,
                                             bool usable_fix,
                                             ControllerSerialPrintfFn serial_printf_normalized) {
+  // Keep formatting centralized here so controller_main.cpp only decides when
+  // status should be emitted, not how GNSS fields are rendered.
   serial_printf_normalized("GPS: usable=%s loc_valid=%s updated=%s lat=%.7f lon=%.7f hdop=%.2f sats=%u age=%lu chars=%lu fix=%lu cksum_fail=%lu\n",
                            usable_fix ? "YES" : "NO",
                            gps.location.isValid() ? "YES" : "NO",

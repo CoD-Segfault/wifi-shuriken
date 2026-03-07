@@ -20,6 +20,11 @@
 #include "controller_gnss_runtime.h"
 #include "controller_scanner_runtime.h"
 
+// Top-level controller orchestration lives here after the runtime split.
+// This file owns Arduino entrypoints, shared peripherals, cross-core queues,
+// SD/logging lifecycle, and wiring between the GNSS and scanner runtimes.
+
+// Hardware/peripheral instances owned by core0.
 SdFat sd;
 FsFile logFile;
 Adafruit_NeoPixel pixels(NUMPIXELS, RGB_PIN, NEO_GRB + NEO_KHZ800);
@@ -40,9 +45,14 @@ static uint32_t dedupe_drops = 0;
 static volatile uint32_t sweep_cycles_completed = 0;
 static volatile uint32_t last_full_sweep_ms = 0;
 
+// Controller-wide dedupe storage used to suppress duplicate results arriving
+// from different scanner slots during the same operating session.
 static constexpr uint16_t MASTER_DEDUPE_CAPACITY = WIFI_DEDUPE_TABLE_CAPACITY;
 static WiFiDedupeHash master_dedupe_storage[MASTER_DEDUPE_CAPACITY];
 static WiFiDedupeTable master_dedupe_table = {};
+
+// SD/logging retry policy remains owned by controller_main.cpp because the
+// logging subsystem still lives here.
 static constexpr uint8_t SD_INIT_MAX_ATTEMPTS = 5;
 static constexpr uint16_t SD_INIT_RETRY_DELAY_MS = 500;
 static constexpr uint16_t SD_RETRY_BACKGROUND_MS = 30000;
@@ -67,6 +77,8 @@ static const pico_logging::Config logging_config = {
 };
 static pico_logging::Logger logging(sd, logFile, gps, GNSS_UART, Serial, logging_config, logging_state);
 
+// Normalize outgoing console text to CRLF so host tools on Linux and Windows
+// render the controller console consistently.
 static void streamWriteNormalized(Stream& stream, const char* text) {
   if (text == nullptr) {
     return;
@@ -93,6 +105,8 @@ static void serialPrintfNormalized(const char* fmt, ...) {
 }
 
 static void serialQueueTry(const char* text) {
+  // core1 cannot safely own the USB console directly, so scanner diagnostics are
+  // queued here and drained from loop() on core0.
   QueuedSerialMsg msg = {};
   strncpy(msg.text, text, sizeof(msg.text) - 1);
   if (!queue_try_add(&serial_msg_queue, &msg)) {
@@ -101,6 +115,8 @@ static void serialQueueTry(const char* text) {
 }
 
 static void handleResetButton() {
+  // Keep the user reset path local to core0 so it can flush logs and the USB
+  // console before triggering the watchdog reboot.
   static bool pressed_latched = false;
   static uint32_t pressed_ms = 0;
   const bool pressed = digitalRead(RESET_BUTTON_PIN) == LOW;
@@ -133,6 +149,8 @@ static void handleResetButton() {
 }
 
 static void serialPrintRuntimeStatus() {
+  // Periodic status combines queue health, logging totals, and scanner sweep
+  // timing so field tuning can be done from one summary line.
   serialPrintfNormalized("Queue drops=%lu serial_drop=%lu dedupe_drop=%lu logged=%lu blank_gps=%lu sweeps=%lu last_sweep_ms=%lu\n",
                          (unsigned long)scan_queue_drops,
                          (unsigned long)serial_msg_drops,
@@ -160,6 +178,8 @@ static void printPeriodicStatus(bool usable_fix) {
 }
 
 void loop2() {
+  // core1 only needs the shared runtime context and then hands control to the
+  // scanner module permanently.
   const ControllerScannerRuntimeContext scanner_runtime = {
     &scan_result_queue,
     &scan_queue_drops,
@@ -192,6 +212,7 @@ void setup() {
 #endif
   Serial.begin(115200);
   controllerGnssRuntimeInitUsbPassthrough();
+  // Give USB a moment to enumerate before the startup burst of status prints.
   delay(2000);
 
   Serial.println("WiFi Shuriken Startup");
@@ -205,7 +226,7 @@ void setup() {
   logging.registerSdDateTimeCallback();
   pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
   Serial.println("Reset button enabled on GPIO17");
-  // Setup SD Card on SPI0
+  // Setup SD card on SPI0 before any logger recovery or CSV path selection.
   SPI.setSCK(SD_PIN_SCK);
   SPI.setTX(SD_PIN_MOSI);
   SPI.setRX(SD_PIN_MISO);
@@ -228,6 +249,8 @@ void setup() {
   } else {
     Serial.println("SD initialization done");
   }
+  // Queue capacities are sized to tolerate short bursts from core1 while core0
+  // is busy with SD or GNSS work.
   queue_init(&scan_result_queue, sizeof(QueuedScanResult), 128);
   queue_init(&serial_msg_queue, sizeof(QueuedSerialMsg), 64);
   wifiDedupeTableInit(&master_dedupe_table, master_dedupe_storage, MASTER_DEDUPE_CAPACITY);
@@ -255,6 +278,8 @@ void setup() {
   // Capture RTC-backed GNSS date/time once per boot for the log filename.
   logging.captureBootTimestampFromGnss();
 
+  // If SD is present, wait until the clock is usable before creating the CSV so
+  // boot-time filenames are timestamped correctly.
   if (logging_state.sd_ready) {
     if (!logging.ensureBootTimestampFromClock()) {
       Serial.println("Waiting for valid GNSS time before creating CSV log file");
@@ -283,7 +308,8 @@ void setup() {
 void loop() {
   handleResetButton();
 
-  // Read GNSS data and update GPS info.
+  // Read GNSS data, update the fix LED, and compute the current "usable fix"
+  // state that drives logging and periodic status.
   const bool usable_fix = controllerGnssRuntimeService(gps, pixels, CONTROLLER_GPS_FIELD_MAX_AGE_MS);
   logging.syncMasterClockFromGnss();
 
