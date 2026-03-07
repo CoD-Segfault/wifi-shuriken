@@ -169,7 +169,6 @@ static constexpr size_t SCANNER_FRAME_SIZE = SPI_FRAME_SIZE;
 static constexpr uint32_t SCANNER_SPI_HZ = SCANNER_SPI_CLOCK;
 static constexpr size_t SCANNER_FRAME_TAG_INDEX = SPI_FRAME_TAG_INDEX;
 static constexpr uint8_t SCANNER_SCAN_RESPONSE_PULLS = 24;
-static constexpr uint8_t SCANNER_SCAN_DFS_RESPONSE_PULLS = 48;
 // Keep RESULT_GET pulls relatively high; result packets are larger and may need extra drains.
 static constexpr uint8_t SCANNER_RESULT_RESPONSE_PULLS = 32;
 // Bound per-slot drain work so one scanner cannot monopolize loop time.
@@ -182,7 +181,6 @@ static constexpr uint8_t SCANNER_RESULT_COUNT_CMD_RETRIES = 1;
 static constexpr uint8_t SCANNER_RESULT_GET_CMD_RETRIES = 1;
 // SCAN handler on slave can take longer than ID/COUNT before the tagged reply is queued.
 static constexpr uint16_t SCANNER_SCAN_FIRST_PULL_US = 4000;
-static constexpr uint16_t SCANNER_SCAN_DFS_FIRST_PULL_US = 12000;
 static constexpr uint8_t SCANNER_SCAN_BUSY_CONFIRM_POLLS = 1;
 static constexpr uint16_t SCANNER_SCAN_BUSY_CONFIRM_DELAY_US = 2500;
 // Scanner transport hardware config (mapped from legacy config macro names).
@@ -237,10 +235,6 @@ static const uint8_t CHANNELS_24G[] = {
 static const uint8_t CHANNELS_5G[] = {
   36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165
 };
-
-static inline bool scannerIsDfsChannel(uint8_t band, uint8_t channel) {
-  return (band == 5u) && (channel >= 52u) && (channel <= 144u);
-}
 
 // band_index: 0=2.4GHz list, 1=5GHz list.
 // channel_index indexes into the current band's channel array.
@@ -485,12 +479,9 @@ static int8_t scannerQueryStatusWithRetry(uint8_t cmd,
                                           uint8_t retries,
                                           int8_t min_valid_status,
                                           int8_t max_valid_status) {
-  uint8_t pulls = response_pulls;
   uint32_t first_pull_wait_us = SCANNER_INTERFRAME_US;
   if (cmd == CMD_SCAN) {
-    const bool dfs = scannerIsDfsChannel(arg1, arg2);
-    pulls = dfs ? SCANNER_SCAN_DFS_RESPONSE_PULLS : response_pulls;
-    first_pull_wait_us = dfs ? SCANNER_SCAN_DFS_FIRST_PULL_US : SCANNER_SCAN_FIRST_PULL_US;
+    first_pull_wait_us = SCANNER_SCAN_FIRST_PULL_US;
   }
 
   for (uint8_t attempt = 0; attempt < retries; attempt++) {
@@ -499,7 +490,7 @@ static int8_t scannerQueryStatusWithRetry(uint8_t cmd,
     tx[0] = cmd;
     tx[1] = arg1;
     tx[2] = arg2;
-    if (scannerCommandWithResponse(tx, cmd, rx, pulls, first_pull_wait_us)) {
+    if (scannerCommandWithResponse(tx, cmd, rx, response_pulls, first_pull_wait_us)) {
       const int8_t status = (int8_t)rx[0];
       if (status >= min_valid_status && status <= max_valid_status) {
         return status;
@@ -651,7 +642,6 @@ static void startScanForCurrentChannel(uint8_t slot,
   }
   if (status == SCANNER_STATUS_TRANSPORT_TIMEOUT) {
     // If SCAN ACK was lost but scanner is now busy, treat scan as started.
-    // DFS start paths can take slightly longer before BUSY is observable.
     for (uint8_t confirm = 0; confirm < SCANNER_SCAN_BUSY_CONFIRM_POLLS; confirm++) {
       const int8_t c = scannerQueryStatusWithRetry(CMD_RESULT_COUNT,
                                                    0,
