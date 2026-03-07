@@ -24,6 +24,14 @@
 #define LED_BUILTIN -1
 #endif
 
+#if SCANNER_SERIAL_LOG
+#define SCANNER_LOG_PRINTF(...) Serial.printf(__VA_ARGS__)
+#define SCANNER_LOG_PRINTLN(x) Serial.println(x)
+#else
+#define SCANNER_LOG_PRINTF(...)
+#define SCANNER_LOG_PRINTLN(x)
+#endif
+
 #if DEBUG_SPI_PROTOCOL
 #define DBG_PRINTF(...) Serial.printf(__VA_ARGS__)
 #define DBG_PRINTLN(x) Serial.println(x)
@@ -129,6 +137,9 @@ static const char* reset_reason_to_str(esp_reset_reason_t reason) {
 }
 
 static void emitBootDiagnosticsIfDue() {
+#if !SCANNER_SERIAL_LOG
+  return;
+#else
   if (boot_diag_emits >= BOOT_DIAG_MAX_EMITS) {
     return;
   }
@@ -138,9 +149,10 @@ static void emitBootDiagnosticsIfDue() {
   }
   boot_diag_next_ms = now + BOOT_DIAG_PERIOD_MS;
   boot_diag_emits++;
-  Serial.printf("Boot reset reason: %d (%s)\n",
-                (int)boot_reset_reason,
-                reset_reason_to_str(boot_reset_reason));
+  SCANNER_LOG_PRINTF("Boot reset reason: %d (%s)\n",
+                     (int)boot_reset_reason,
+                     reset_reason_to_str(boot_reset_reason));
+#endif
 }
 
 static bool is_dfs_channel(uint8_t band, uint8_t channel) {
@@ -197,17 +209,17 @@ static void write_status_response(int8_t value) {
 static void noteDedupeHit(int index, const WiFiResult& r) {
   scan_dedupe_hits++;
   if (scan_dedupe_logs < LOG_DEDUPE_HITS_MAX_PER_SCAN) {
-    Serial.printf("[SLAVE] dedupe hit idx=%d ssid='%s' ch=%u band=%u rssi=%d\n",
-                  index, r.ssid, r.channel, r.band, r.rssi);
+    SCANNER_LOG_PRINTF("[SLAVE] dedupe hit idx=%d ssid='%s' ch=%u band=%u rssi=%d\n",
+                       index, r.ssid, r.channel, r.band, r.rssi);
     scan_dedupe_logs++;
   }
 }
 
 static void logDedupeSuppressedSummary() {
   if (scan_dedupe_hits > scan_dedupe_logs) {
-    Serial.printf("[SLAVE] dedupe hits suppressed: %lu (total=%lu)\n",
-                  (unsigned long)(scan_dedupe_hits - scan_dedupe_logs),
-                  (unsigned long)scan_dedupe_hits);
+    SCANNER_LOG_PRINTF("[SLAVE] dedupe hits suppressed: %lu (total=%lu)\n",
+                       (unsigned long)(scan_dedupe_hits - scan_dedupe_logs),
+                       (unsigned long)scan_dedupe_hits);
   }
 }
 #endif
@@ -259,8 +271,8 @@ static void process_scan_results_into_spi_buffer(int budget = 4) {
     spi_status = static_cast<int8_t>(spi_result_count);
     // Snapshot fully processed; scanner is now idle from RF perspective.
     scannerStatusLedSet(false);
-    Serial.printf("Buffered %u unique results (band %u ch %u)\n",
-                  (unsigned)spi_result_count, last_scan_band, last_scan_channel);
+    SCANNER_LOG_PRINTF("Buffered %u unique results (band %u ch %u)\n",
+                       (unsigned)spi_result_count, last_scan_band, last_scan_channel);
   }
 }
 
@@ -284,7 +296,7 @@ static void start_channel_scan(uint8_t band, uint8_t channel) {
              band, channel, passive ? 1 : 0, dwell, n);
 
   if (n == SCANNER_RADIO_SCAN_FAILED) {
-    Serial.printf("Scan start failed on band %u ch %u (ret=%d)\n", band, channel, n);
+    SCANNER_LOG_PRINTF("Scan start failed on band %u ch %u (ret=%d)\n", band, channel, n);
     setScanEngineIdle();
     last_scan_status = SCANNER_STATUS_START_FAILED;
     return;
@@ -294,8 +306,8 @@ static void start_channel_scan(uint8_t band, uint8_t channel) {
   last_scan_status = SCANNER_STATUS_OK;
   spi_status = SCANNER_STATUS_BUSY;
   scannerStatusLedSet(true);
-  Serial.printf("Started scan band %u ch %u (%s, %dms, ret=%d)\n",
-                band, channel, passive ? "passive" : "active", dwell, n);
+  SCANNER_LOG_PRINTF("Started scan band %u ch %u (%s, %dms, ret=%d)\n",
+                     band, channel, passive ? "passive" : "active", dwell, n);
 }
 
 static void update_scan_state() {
@@ -310,7 +322,7 @@ static void update_scan_state() {
     if (n < 0) {
       // Failed or aborted.
       abortScanAndSetIdle();
-      Serial.println("Scan failed/aborted");
+      SCANNER_LOG_PRINTLN("Scan failed/aborted");
       return;
     }
 
@@ -321,15 +333,15 @@ static void update_scan_state() {
 
     // Safety: enforce protocol max.
     if (n > PROTO_MAX_RESULTS) {
-      Serial.printf("Warning: scan returned %d results; clamping to %u\n",
-                    n, (unsigned)PROTO_MAX_RESULTS);
+      SCANNER_LOG_PRINTF("Warning: scan returned %d results; clamping to %u\n",
+                         n, (unsigned)PROTO_MAX_RESULTS);
       scan_count = PROTO_MAX_RESULTS;
     } else {
       scan_count = n;
     }
 
-    Serial.printf("Scan complete: %d results (band %u ch %u)\n",
-                  scan_count, last_scan_band, last_scan_channel);
+    SCANNER_LOG_PRINTF("Scan complete: %d results (band %u ch %u)\n",
+                       scan_count, last_scan_band, last_scan_channel);
   }
 
   // Phase 2: post-process raw snapshot into deduped SPI buffer.
@@ -473,7 +485,9 @@ static void handle_command(uint8_t cmd_byte) {
 }
 
 void setup() {
+#if SCANNER_SERIAL_LOG || DEBUG_SPI_PROTOCOL
   Serial.begin(115200);
+#endif
   boot_reset_reason = esp_reset_reason();
   boot_diag_next_ms = 0;
   boot_diag_emits = 0;
@@ -484,17 +498,17 @@ void setup() {
   // Keep reboot-to-SPI-ready latency low so the Pico can recover quickly.
   delay(100);
 
-  Serial.println("ESP32-C5 Scanner (Arduino WiFi + SPI slave, command protocol)");
+  SCANNER_LOG_PRINTLN("ESP32-C5 Scanner (Arduino WiFi + SPI slave, command protocol)");
 
   if (!scannerRadioInit()) {
-    Serial.println("scannerRadioInit failed");
+    SCANNER_LOG_PRINTLN("scannerRadioInit failed");
     while (1) delay(1000);
   }
   delay(100);
 
   if (!scannerSpiSlaveInit(PIN_SCK, PIN_MOSI, PIN_MISO, PIN_CS,
                            FRAME_SIZE, SPI_TRANSACTION_QUEUE_SIZE)) {
-    Serial.println("scannerSpiSlaveInit failed");
+    SCANNER_LOG_PRINTLN("scannerSpiSlaveInit failed");
     while (1) delay(1000);
   }
 
@@ -505,7 +519,7 @@ void setup() {
 
   // Boot complete: scanner is ready/idle.
   scannerStatusLedSet(false);
-  Serial.println("SPI slave ready");
+  SCANNER_LOG_PRINTLN("SPI slave ready");
 }
 
 void loop() {
