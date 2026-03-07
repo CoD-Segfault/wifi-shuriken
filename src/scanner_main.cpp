@@ -20,15 +20,19 @@
 */
 
 #ifndef PIN_SCK
+// XIAO ESP32-C5 default SPI slave clock pin.
 #define PIN_SCK   8
 #endif
 #ifndef PIN_MOSI
+// XIAO ESP32-C5 default SPI slave MOSI pin.
 #define PIN_MOSI  10
 #endif
 #ifndef PIN_MISO
+// XIAO ESP32-C5 default SPI slave MISO pin.
 #define PIN_MISO  9
 #endif
 #ifndef PIN_CS
+// XIAO ESP32-C5 default SPI slave CS pin.
 #define PIN_CS    7
 #endif
 
@@ -39,9 +43,11 @@
 #define SCANNER_STATUS_LED_ENABLED 1
 #endif
 #ifndef SCANNER_STATUS_LED_PIN
+// XIAO ESP32-C5 default status LED pin.
 #define SCANNER_STATUS_LED_PIN 27
 #endif
 #ifndef SCANNER_STATUS_LED_ACTIVE_LOW
+// XIAO ESP32-C5 status LED is active-low.
 #define SCANNER_STATUS_LED_ACTIVE_LOW 1
 #endif
 

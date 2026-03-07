@@ -8,7 +8,7 @@
 #include <string.h>
 
 #ifndef SCANNER_SPI_MISO_DRIVE_CAP
-// Use strongest default drive on MISO for longer/noisier wiring.
+// XIAO ESP32-C5 default: use strongest MISO drive for longer/noisier wiring.
 #define SCANNER_SPI_MISO_DRIVE_CAP GPIO_DRIVE_CAP_3
 #endif
 
