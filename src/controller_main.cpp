@@ -181,8 +181,8 @@ static constexpr uint8_t SCANNER_SCAN_CMD_RETRIES = 1;
 static constexpr uint8_t SCANNER_QUERY_CMD_RETRIES = 2;
 static constexpr uint8_t SCANNER_RESULT_COUNT_CMD_RETRIES = 1;
 static constexpr uint8_t SCANNER_RESULT_GET_CMD_RETRIES = 1;
-// SCAN handler on slave can take longer than ID/COUNT before the tagged reply is queued.
-static constexpr uint16_t SCANNER_SCAN_FIRST_PULL_US = 4000;
+// Keep a short guard gap after CMD_SCAN before the first response pull.
+static constexpr uint16_t SCANNER_SCAN_FIRST_PULL_US = 3000;
 static constexpr uint8_t SCANNER_SCAN_BUSY_CONFIRM_POLLS = 1;
 static constexpr uint16_t SCANNER_SCAN_BUSY_CONFIRM_DELAY_US = 2500;
 // Scanner transport hardware config (mapped from legacy config macro names).
