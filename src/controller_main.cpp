@@ -74,6 +74,31 @@ static const pico_logging::Config logging_config = {
 };
 static pico_logging::Logger logging(sd, logFile, gps, GNSS_UART, Serial, logging_config, logging_state);
 
+static void streamWriteNormalized(Stream& stream, const char* text) {
+  if (text == nullptr) {
+    return;
+  }
+
+  char prev = '\0';
+  while (*text != '\0') {
+    const char c = *text++;
+    if (c == '\n' && prev != '\r') {
+      stream.write('\r');
+    }
+    stream.write(static_cast<uint8_t>(c));
+    prev = c;
+  }
+}
+
+static void serialPrintfNormalized(const char* fmt, ...) {
+  char buf[256];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  streamWriteNormalized(Serial, buf);
+}
+
 static void serialQueueTry(const char* text) {
   QueuedSerialMsg msg = {};
   strncpy(msg.text, text, sizeof(msg.text) - 1);
@@ -845,27 +870,27 @@ static void processScannerSlot(uint8_t slot,
 }
 
 static void serialPrintRuntimeStatus() {
-  Serial.printf("Queue drops=%lu serial_drop=%lu dedupe_drop=%lu logged=%lu blank_gps=%lu\n",
-                (unsigned long)scan_queue_drops,
-                (unsigned long)serial_msg_drops,
-                (unsigned long)dedupe_drops,
-                (unsigned long)logging_state.csv_rows,
-                (unsigned long)logging_state.csv_rows_blank_gps);
+  serialPrintfNormalized("Queue drops=%lu serial_drop=%lu dedupe_drop=%lu logged=%lu blank_gps=%lu\n",
+                         (unsigned long)scan_queue_drops,
+                         (unsigned long)serial_msg_drops,
+                         (unsigned long)dedupe_drops,
+                         (unsigned long)logging_state.csv_rows,
+                         (unsigned long)logging_state.csv_rows_blank_gps);
 }
 
 static void serialPrintGpsStatus(bool usable_fix) {
-  Serial.printf("GPS: usable=%s loc_valid=%s updated=%s lat=%.7f lon=%.7f hdop=%.2f sats=%u age=%lu chars=%lu fix=%lu cksum_fail=%lu\n",
-                usable_fix ? "YES" : "NO",
-                gps.location.isValid() ? "YES" : "NO",
-                gps.location.isUpdated() ? "YES" : "NO",
-                gps.location.isValid() ? gps.location.lat() : 0.0,
-                gps.location.isValid() ? gps.location.lng() : 0.0,
-                gps.hdop.isValid() ? gps.hdop.hdop() : 0.0,
-                gps.satellites.isValid() ? gps.satellites.value() : 0,
-                (unsigned long)gps.location.age(),
-                (unsigned long)gps.charsProcessed(),
-                (unsigned long)gps.sentencesWithFix(),
-                (unsigned long)gps.failedChecksum());
+  serialPrintfNormalized("GPS: usable=%s loc_valid=%s updated=%s lat=%.7f lon=%.7f hdop=%.2f sats=%u age=%lu chars=%lu fix=%lu cksum_fail=%lu\n",
+                         usable_fix ? "YES" : "NO",
+                         gps.location.isValid() ? "YES" : "NO",
+                         gps.location.isUpdated() ? "YES" : "NO",
+                         gps.location.isValid() ? gps.location.lat() : 0.0,
+                         gps.location.isValid() ? gps.location.lng() : 0.0,
+                         gps.hdop.isValid() ? gps.hdop.hdop() : 0.0,
+                         gps.satellites.isValid() ? gps.satellites.value() : 0,
+                         (unsigned long)gps.location.age(),
+                         (unsigned long)gps.charsProcessed(),
+                         (unsigned long)gps.sentencesWithFix(),
+                         (unsigned long)gps.failedChecksum());
 }
 
 static void printPeriodicStatus(bool usable_fix) {
@@ -938,12 +963,12 @@ void setup() {
   delay(2000);
 
   Serial.println("WiFi Shuriken Startup");
-  Serial.printf("RGB config: data=%d power_en=%d power_pin=%d\n",
-                RGB_PIN, RGB_POWER_ENABLED, RGB_POWER_PIN);
+  serialPrintfNormalized("RGB config: data=%d power_en=%d power_pin=%d\n",
+                         RGB_PIN, RGB_POWER_ENABLED, RGB_POWER_PIN);
   logging.initUtcTimezone();
 #if defined(USE_TINYUSB)
-  Serial.printf("USB CDC IDs: CDC0='%s' CDC1='%s'\n",
-                USB_CDC0_IFACE_NAME, USB_CDC1_IFACE_NAME);
+  serialPrintfNormalized("USB CDC IDs: CDC0='%s' CDC1='%s'\n",
+                         USB_CDC0_IFACE_NAME, USB_CDC1_IFACE_NAME);
 #endif
   logging.registerSdDateTimeCallback();
   pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
@@ -980,8 +1005,8 @@ void setup() {
   scannerInitBus();
 
 #if SCANNER_USE_SHIFTREG_CS
-  Serial.printf("SPI1 initialized (shift-register scanner CS enabled, slots=%u).\n",
-                (unsigned)SCANNER_SLOT_COUNT);
+  serialPrintfNormalized("SPI1 initialized (shift-register scanner CS enabled, slots=%u).\n",
+                         (unsigned)SCANNER_SLOT_COUNT);
 #else
   Serial.println("SPI1 initialized.");
 #endif
@@ -1050,7 +1075,7 @@ void loop() {
   QueuedSerialMsg sm = {};
   int serial_drained = 0;
   while (serial_drained < 16 && queue_try_remove(&serial_msg_queue, &sm)) {
-    Serial.print(sm.text);
+    streamWriteNormalized(Serial, sm.text);
     serial_drained++;
   }
 
