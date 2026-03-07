@@ -144,6 +144,29 @@
 #define CORE1_SERIAL_LOG 1  // 1 enables core1 diagnostic queue logging.
 #endif
 
+// Periodic runtime/GPS status print interval in milliseconds.
+// Set to 0 to disable the periodic summary lines entirely.
+#ifndef PERIODIC_STATUS_INTERVAL_MS
+#define PERIODIC_STATUS_INTERVAL_MS 5000
+#endif
+
+// Log routine successful scan-start messages from the controller scheduler.
+// Warning/error scan diagnostics still print regardless.
+#ifndef SCAN_LOG_NORMAL_STARTS
+#define SCAN_LOG_NORMAL_STARTS 0  // 1 enables logging of all successful scan starts.
+#endif
+
+// Log number of controller-side dedupe hits per scan when the buffered results are emitted.
+#ifndef LOG_DEDUPE_HITS
+#define LOG_DEDUPE_HITS 0  // 1 enables logging of dedupe hits.
+#endif
+
+// Log each individual controller-side dedupe hit. The aggregate per-scan
+// suppressed summary still follows LOG_DEDUPE_HITS.
+#ifndef CONTROLLER_LOG_INDIVIDUAL_DEDUPE_HITS
+#define CONTROLLER_LOG_INDIVIDUAL_DEDUPE_HITS 0
+#endif
+
 // SPI delay between command and follow-up polling frame in microseconds.
 #ifndef ESP_INTERFRAME_US
 #define ESP_INTERFRAME_US 10  // Delay between SPI command and response pulls.

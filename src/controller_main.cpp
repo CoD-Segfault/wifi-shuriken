@@ -657,8 +657,10 @@ static void startScanForCurrentChannel(uint8_t slot,
                                                     SCANNER_STATUS_START_FAILED,
                                                     SCANNER_STATUS_OK);
   if (status == SCANNER_STATUS_OK) {
+#if SCAN_LOG_NORMAL_STARTS
     serialPrintfTry("S%u Scan started (band=%u ch=%u)\n",
                     (unsigned)slot, band, channel);
+#endif
     advanceSweepChannelAndLog(sweep_band_index,
                               sweep_channel_index,
                               sweep_timing_active,
@@ -863,6 +865,7 @@ static void processScannerSlot(uint8_t slot,
         dedupe_drops++;
         batch_dedupe_hits++;
 #if LOG_DEDUPE_HITS
+#if CONTROLLER_LOG_INDIVIDUAL_DEDUPE_HITS
         if (batch_dedupe_logs < LOG_DEDUPE_HITS_MAX_PER_SCAN) {
           char mac[18] = {};
           pico_logging::formatBssid(pkt.result.bssid, mac, sizeof(mac));
@@ -875,6 +878,7 @@ static void processScannerSlot(uint8_t slot,
                           pkt.result.rssi);
           batch_dedupe_logs++;
         }
+#endif
 #endif
         continue;
       }
@@ -948,13 +952,18 @@ static void serialPrintGpsStatus(bool usable_fix) {
 
 static void printPeriodicStatus(bool usable_fix) {
   static uint32_t lastStatMs = 0;
+#if PERIODIC_STATUS_INTERVAL_MS == 0
+  (void)usable_fix;
+  return;
+#else
   const uint32_t now = millis();
-  if ((now - lastStatMs) <= 10000) {
+  if ((now - lastStatMs) <= PERIODIC_STATUS_INTERVAL_MS) {
     return;
   }
   lastStatMs = now;
   serialPrintRuntimeStatus();
   serialPrintGpsStatus(usable_fix);
+#endif
 }
 
 void loop2() {
