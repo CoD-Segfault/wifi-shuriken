@@ -5,7 +5,6 @@
 #include <SdFat.h>
 #if defined(USE_TINYUSB)
 #include <Adafruit_TinyUSB.h>
-#include "class/cdc/cdc_device.h"
 #endif
 #include "pico/multicore.h"
 #include "pico/util/queue.h"
@@ -18,18 +17,13 @@
 #include "pico_logging.h"
 #include "wifi_dedupe.h"
 #include "Configuration.h"
+#include "controller_gnss_runtime.h"
 #include "controller_scanner_runtime.h"
-
-static constexpr uint32_t GNSS_TARGET_BAUD = 115200;
 
 SdFat sd;
 FsFile logFile;
 Adafruit_NeoPixel pixels(NUMPIXELS, RGB_PIN, NEO_GRB + NEO_KHZ800);
 TinyGPSPlus gps;
-#if defined(USE_TINYUSB)
-static Adafruit_USBD_CDC nmea_passthrough_cdc;
-static constexpr uint8_t NMEA_PASSTHROUGH_CDC_INSTANCE = 1;
-#endif
 using QueuedScanResult = pico_logging::QueuedScanResult;
 
 // Cross-core queues:
@@ -45,7 +39,6 @@ static uint32_t serial_msg_drops = 0;
 static uint32_t dedupe_drops = 0;
 static volatile uint32_t sweep_cycles_completed = 0;
 static volatile uint32_t last_full_sweep_ms = 0;
-static constexpr uint16_t GPS_FIELD_MAX_AGE_MS = 3000;
 
 static constexpr uint16_t MASTER_DEDUPE_CAPACITY = WIFI_DEDUPE_TABLE_CAPACITY;
 static WiFiDedupeHash master_dedupe_storage[MASTER_DEDUPE_CAPACITY];
@@ -54,12 +47,9 @@ static constexpr uint8_t SD_INIT_MAX_ATTEMPTS = 5;
 static constexpr uint16_t SD_INIT_RETRY_DELAY_MS = 500;
 static constexpr uint16_t SD_RETRY_BACKGROUND_MS = 30000;
 static constexpr uint32_t SD_SPI_CLOCKS_HZ[] = {SD_SPI_CLOCK, 4000000, 1000000, 400000}; // 10MHz init, then back off to more reliable speeds if needed.
-static constexpr uint16_t GNSS_BOOT_TIMESTAMP_WAIT_MS = 6000;
-static constexpr uint8_t GNSS_BOOT_TIMESTAMP_READS = 5;
 static constexpr uint8_t RESET_BUTTON_DEBOUNCE_MS = 50;
 static constexpr uint16_t CSV_LOG_TIME_WAIT_RETRY_MS = 1000;
 static constexpr uint16_t CSV_LOG_FLUSH_INTERVAL_MS = 5000;
-static constexpr uint16_t GNSS_MIN_VALID_YEAR = 2026;
 
 static pico_logging::State logging_state = {};
 static const pico_logging::Config logging_config = {
@@ -68,12 +58,12 @@ static const pico_logging::Config logging_config = {
   sizeof(SD_SPI_CLOCKS_HZ) / sizeof(SD_SPI_CLOCKS_HZ[0]),
   SD_INIT_RETRY_DELAY_MS,
   SD_RETRY_BACKGROUND_MS,
-  GNSS_BOOT_TIMESTAMP_WAIT_MS,
-  GNSS_BOOT_TIMESTAMP_READS,
-  GPS_FIELD_MAX_AGE_MS,
+  CONTROLLER_GNSS_BOOT_TIMESTAMP_WAIT_MS,
+  CONTROLLER_GNSS_BOOT_TIMESTAMP_READS,
+  CONTROLLER_GPS_FIELD_MAX_AGE_MS,
   CSV_LOG_TIME_WAIT_RETRY_MS,
   CSV_LOG_FLUSH_INTERVAL_MS,
-  GNSS_MIN_VALID_YEAR
+  CONTROLLER_GNSS_MIN_VALID_YEAR
 };
 static pico_logging::Logger logging(sd, logFile, gps, GNSS_UART, Serial, logging_config, logging_state);
 
@@ -108,76 +98,6 @@ static void serialQueueTry(const char* text) {
   if (!queue_try_add(&serial_msg_queue, &msg)) {
     serial_msg_drops++;
   }
-}
-
-static inline void nmeaPassthroughWriteChar(char c) {
-#if !NMEA_PASSTHROUGH
-  (void)c;
-#elif defined(USE_TINYUSB)
-  // Bypass the Arduino CDC wrapper here because it drops writes unless the
-  // host asserts DTR. gpsd often opens the tty without doing that.
-  if (tud_cdc_n_ready(NMEA_PASSTHROUGH_CDC_INSTANCE)) {
-    tud_cdc_n_write_char(NMEA_PASSTHROUGH_CDC_INSTANCE, c);
-    if (c == '\n') {
-      tud_cdc_n_write_flush(NMEA_PASSTHROUGH_CDC_INSTANCE);
-    }
-  }
-#else
-  Serial.write(static_cast<uint8_t>(c));
-#endif
-}
-
-static void updateGpsFixLed(bool usable_fix) {
-  static int8_t last_state = -1;
-  const int8_t state = usable_fix ? 1 : 0;
-  if (state == last_state) {
-    return;
-  }
-  last_state = state;
-
-  const uint32_t color = usable_fix ? pixels.Color(0, 96, 0) : pixels.Color(75, 20, 0);
-  pixels.setPixelColor(0, color);
-  pixels.show();
-}
-
-void sendPMTKCommand(const char* cmd) {
-  GNSS_UART.println(cmd);
-  Serial.print("Sent PMTK Command: ");
-  Serial.println(cmd);
-  delay(100); // Short delay to ensure command is processed
-}
-
-static void gnssUartBeginWithConfiguredBuffer(uint32_t baud) {
-  static bool fifo_warned = false;
-  if (!GNSS_UART.setFIFOSize(SERIAL_BUFFER_SIZE) && !fifo_warned) {
-    Serial.print("Warning: GNSS UART FIFO resize failed, keeping default. requested=");
-    Serial.println((unsigned)SERIAL_BUFFER_SIZE);
-    fifo_warned = true;
-  }
-  GNSS_UART.begin(baud);
-}
-
-static void configureGnssBaudToTarget() {
-  static const uint32_t probe_bauds[] = {115200, 9600, 38400};
-
-  // Try the baud-rate switch command at common existing rates so legacy and
-  // newer modules both converge to GNSS_TARGET_BAUD.
-  for (size_t i = 0; i < (sizeof(probe_bauds) / sizeof(probe_bauds[0])); i++) {
-    GNSS_UART.end();
-    gnssUartBeginWithConfiguredBuffer(probe_bauds[i]);
-    delay(30);
-    GNSS_UART.println("$PMTK251,115200*1F");
-    GNSS_UART.flush();
-    delay(80);
-  }
-
-  GNSS_UART.end();
-  gnssUartBeginWithConfiguredBuffer(GNSS_TARGET_BAUD);
-  Serial.print("GNSS UART configured to ");
-  Serial.print(GNSS_TARGET_BAUD);
-  Serial.print(" baud (FIFO=");
-  Serial.print((unsigned)SERIAL_BUFFER_SIZE);
-  Serial.println(").");
 }
 
 static void handleResetButton() {
@@ -223,21 +143,6 @@ static void serialPrintRuntimeStatus() {
                          (unsigned long)last_full_sweep_ms);
 }
 
-static void serialPrintGpsStatus(bool usable_fix) {
-  serialPrintfNormalized("GPS: usable=%s loc_valid=%s updated=%s lat=%.7f lon=%.7f hdop=%.2f sats=%u age=%lu chars=%lu fix=%lu cksum_fail=%lu\n",
-                         usable_fix ? "YES" : "NO",
-                         gps.location.isValid() ? "YES" : "NO",
-                         gps.location.isUpdated() ? "YES" : "NO",
-                         gps.location.isValid() ? gps.location.lat() : 0.0,
-                         gps.location.isValid() ? gps.location.lng() : 0.0,
-                         gps.hdop.isValid() ? gps.hdop.hdop() : 0.0,
-                         gps.satellites.isValid() ? gps.satellites.value() : 0,
-                         (unsigned long)gps.location.age(),
-                         (unsigned long)gps.charsProcessed(),
-                         (unsigned long)gps.sentencesWithFix(),
-                         (unsigned long)gps.failedChecksum());
-}
-
 static void printPeriodicStatus(bool usable_fix) {
   static uint32_t lastStatMs = 0;
 #if PERIODIC_STATUS_INTERVAL_MS == 0
@@ -250,7 +155,7 @@ static void printPeriodicStatus(bool usable_fix) {
   }
   lastStatMs = now;
   serialPrintRuntimeStatus();
-  serialPrintGpsStatus(usable_fix);
+  controllerGnssRuntimeSerialPrintStatus(gps, usable_fix, serialPrintfNormalized);
 #endif
 }
 
@@ -286,14 +191,7 @@ void setup() {
   }
 #endif
   Serial.begin(115200);
-#if defined(USE_TINYUSB)
-  nmea_passthrough_cdc.begin(115200);
-  if (TinyUSBDevice.mounted()) {
-    TinyUSBDevice.detach();
-    delay(10);
-    TinyUSBDevice.attach();
-  }
-#endif
+  controllerGnssRuntimeInitUsbPassthrough();
   delay(2000);
 
   Serial.println("WiFi Shuriken Startup");
@@ -348,13 +246,11 @@ void setup() {
   Serial.println("Scanner MISO internal pull-up enabled");
 #endif
   // Initialize GNSS UART
-  GNSS_UART.setTX(GNSS_TX);
-  GNSS_UART.setRX(GNSS_RX);
-  configureGnssBaudToTarget();
+  controllerGnssRuntimeInitUart();
 
   // Configure GNSS module for 5Hz update rate and disable unnecessary NMEA sentences
-  sendPMTKCommand("$PMTK220,200*2C"); // Set update rate to 5Hz
-  sendPMTKCommand("$PMTK314,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0*28"); // Enable GGA and RMC sentences only
+  controllerGnssRuntimeSendPMTKCommand("$PMTK220,200*2C"); // Set update rate to 5Hz
+  controllerGnssRuntimeSendPMTKCommand("$PMTK314,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0*28"); // Enable GGA and RMC sentences only
 
   // Capture RTC-backed GNSS date/time once per boot for the log filename.
   logging.captureBootTimestampFromGnss();
@@ -388,22 +284,8 @@ void loop() {
   handleResetButton();
 
   // Read GNSS data and update GPS info.
-  while (GNSS_UART.available()) {
-    char c = GNSS_UART.read();
-    gps.encode(c);
-
-#if NMEA_PASSTHROUGH
-    nmeaPassthroughWriteChar(c);
-#endif
-  }
+  const bool usable_fix = controllerGnssRuntimeService(gps, pixels, CONTROLLER_GPS_FIELD_MAX_AGE_MS);
   logging.syncMasterClockFromGnss();
-
-  const bool usable_fix =
-      gps.location.isValid() &&
-      gps.location.age() < GPS_FIELD_MAX_AGE_MS &&
-      gps.satellites.isValid() &&
-      gps.satellites.value() >= 3;
-  updateGpsFixLed(usable_fix);
 
   // Drain core1 serial messages via queue (caps work per iteration).
   QueuedSerialMsg sm = {};
