@@ -5,6 +5,7 @@
 #include <SdFat.h>
 #if defined(USE_TINYUSB)
 #include <Adafruit_TinyUSB.h>
+#include "class/cdc/cdc_device.h"
 #endif
 #include "pico/multicore.h"
 #include "pico/util/queue.h"
@@ -28,6 +29,9 @@ Adafruit_NeoPixel pixels(NUMPIXELS, RGB_PIN, NEO_GRB + NEO_KHZ800);
 TinyGPSPlus gps;
 #if defined(USE_TINYUSB)
 static Adafruit_USBD_CDC nmea_passthrough_cdc;
+static constexpr uint8_t NMEA_PASSTHROUGH_CDC_INSTANCE = 1;
+static constexpr uint8_t NMEA_PASSTHROUGH_WRITE_YIELD_ATTEMPTS = 4;
+static constexpr size_t NMEA_PASSTHROUGH_HOST_RX_CHUNK = 64;
 #endif
 using QueuedScanResult = pico_logging::QueuedScanResult;
 
@@ -136,11 +140,56 @@ static inline void nmeaPassthroughWriteChar(char c) {
 #if !NMEA_PASSTHROUGH
   (void)c;
 #elif defined(USE_TINYUSB)
-  if (nmea_passthrough_cdc) {
-    nmea_passthrough_cdc.write(static_cast<uint8_t>(c));
+  // Bypass the Arduino CDC wrapper here because it drops writes unless the
+  // host asserts DTR. gpsd often opens the tty without doing that.
+  if (!tud_cdc_n_ready(NMEA_PASSTHROUGH_CDC_INSTANCE)) {
+    return;
+  }
+
+  for (uint8_t attempt = 0; attempt < NMEA_PASSTHROUGH_WRITE_YIELD_ATTEMPTS; ++attempt) {
+    if (tud_cdc_n_write_available(NMEA_PASSTHROUGH_CDC_INSTANCE) > 0 &&
+        tud_cdc_n_write_char(NMEA_PASSTHROUGH_CDC_INSTANCE, c) == 1) {
+      if (c == '\n' || tud_cdc_n_write_available(NMEA_PASSTHROUGH_CDC_INSTANCE) < 16) {
+        tud_cdc_n_write_flush(NMEA_PASSTHROUGH_CDC_INSTANCE);
+      }
+      return;
+    }
+
+    tud_cdc_n_write_flush(NMEA_PASSTHROUGH_CDC_INSTANCE);
+    yield();
   }
 #else
   Serial.write(static_cast<uint8_t>(c));
+#endif
+}
+
+static inline void nmeaPassthroughServiceHostInput() {
+#if !NMEA_PASSTHROUGH
+  return;
+#elif defined(USE_TINYUSB)
+  if (!tud_cdc_n_ready(NMEA_PASSTHROUGH_CDC_INSTANCE)) {
+    return;
+  }
+
+  uint8_t rx_buf[NMEA_PASSTHROUGH_HOST_RX_CHUNK];
+  while (tud_cdc_n_available(NMEA_PASSTHROUGH_CDC_INSTANCE) > 0) {
+    const uint32_t read_count = tud_cdc_n_read(NMEA_PASSTHROUGH_CDC_INSTANCE,
+                                               rx_buf,
+                                               sizeof(rx_buf));
+    if (read_count == 0) {
+      break;
+    }
+
+    GNSS_UART.write(rx_buf, read_count);
+
+    for (uint32_t i = 0; i < read_count; ++i) {
+      const uint8_t c = rx_buf[i];
+      if (c == '\r' || c == '\n') {
+        GNSS_UART.flush();
+        break;
+      }
+    }
+  }
 #endif
 }
 
@@ -1052,6 +1101,7 @@ void setup() {
 
 void loop() {
   handleResetButton();
+  nmeaPassthroughServiceHostInput();
 
   // Read GNSS data and update GPS info.
   while (GNSS_UART.available()) {
