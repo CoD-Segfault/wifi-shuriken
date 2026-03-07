@@ -1,21 +1,12 @@
 // scanner_platform_esp32_spi.cpp
 #include "scanner_platform_esp32_spi.h"
+#include "ScannerConfiguration.h"
 
 #include <driver/gpio.h>
 #include <driver/spi_slave.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <string.h>
-
-#ifndef SCANNER_SPI_MISO_DRIVE_CAP
-// XIAO ESP32-C5 default: use strongest MISO drive for longer/noisier wiring.
-#define SCANNER_SPI_MISO_DRIVE_CAP GPIO_DRIVE_CAP_3
-#endif
-
-#ifndef SCANNER_SPI_DMA_CH
-// ESP32-C5 requires auto-allocation for SPI slave DMA channel selection.
-#define SCANNER_SPI_DMA_CH SPI_DMA_CH_AUTO
-#endif
 
 // Keep a single persistent queued transaction so timeouts do not leave
 // the SPI ISR with a dangling pointer to a stack-local transaction object.
