@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "hardware/gpio.h"
+#include "channel_scheduler.h"
 #include "pico_logging.h"
 #include "spi_protocol_shared.h"
 #include "wifi_result_utils.h"
@@ -77,14 +78,6 @@ struct ScannerSlotState {
   uint8_t transport_timeouts;
 };
 
-static const uint8_t CHANNELS_24G[] = {
-  1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14
-};
-
-static const uint8_t CHANNELS_5G[] = {
-  36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165
-};
-
 // Persistent core1 runtime state. controller_main.cpp owns the shared queues and
 // counters, but the scanner runtime owns the active slot machine and sweep state.
 static ControllerScannerRuntimeContext scanner_runtime_context = {};
@@ -94,9 +87,8 @@ static uint8_t scanner_active_slot = SCANNER_INITIAL_SLOT;
 static bool scanner_shiftreg_outputs_enabled = false;
 #endif
 static ScannerSlotState scanner_slot_state[SCANNER_SLOT_COUNT] = {};
-// A single global sweep order is shared across all scanner slots.
-static size_t scanner_sweep_band_index = 0;
-static size_t scanner_sweep_channel_index = 0;
+// A single global channel dispatch plan is shared across all scanner slots.
+static ChannelScheduleState scanner_schedule_state = {};
 static bool scanner_sweep_timing_active = false;
 static uint32_t scanner_sweep_started_ms = 0;
 static uint8_t scanner_slot = SCANNER_INITIAL_SLOT;
@@ -132,29 +124,11 @@ static void scannerSerialPrintfTry(const char* fmt, ...) {
 #endif
 }
 
-// band_index: 0=2.4GHz list, 1=5GHz list.
-// channel_index indexes into the current band's channel array.
-static bool advanceSweepChannel(size_t& band_index, size_t& channel_index) {
-  channel_index++;
-  if (band_index == 0 && channel_index >= (sizeof(CHANNELS_24G) / sizeof(CHANNELS_24G[0]))) {
-    band_index = 1;
-    channel_index = 0;
-    return false;
-  }
-  if (band_index == 1 && channel_index >= (sizeof(CHANNELS_5G) / sizeof(CHANNELS_5G[0]))) {
-    band_index = 0;
-    channel_index = 0;
-    return true;
-  }
-  return false;
-}
-
-// Sweep timing starts when the shared scheduler wraps to channel 1 on 2.4GHz.
-static inline void sweepTimingNoteStart(size_t band_index,
-                                        size_t channel_index,
-                                        bool& timing_active,
+// Sweep timing starts with the first scheduled channel after the previous
+// coverage cycle completes.
+static inline void sweepTimingNoteStart(bool& timing_active,
                                         uint32_t& started_ms) {
-  if (!timing_active && band_index == 0 && channel_index == 0) {
+  if (!timing_active) {
     started_ms = millis();
     timing_active = true;
   }
@@ -201,24 +175,22 @@ static inline void scannerShiftRegWriteCsState(uint8_t state, bool force) {
 }
 #endif
 
-static inline void advanceSweepChannelAndLog(size_t& band_index,
-                                             size_t& channel_index,
+static inline void advanceSweepChannelAndLog(ChannelScheduleState& schedule_state,
                                              bool& timing_active,
                                              uint32_t& started_ms) {
-  // The scheduler is global across all slots, so sweep completion is only
-  // recognized when the shared channel cursor wraps from the end of 5GHz back
-  // to the start of 2.4GHz.
-  if (advanceSweepChannel(band_index, channel_index)) {
+  // The scheduler is global across all slots. A coverage cycle completes once
+  // both bands have wrapped at least once under the mixed-band dispatch plan.
+  if (channelScheduleAdvance(schedule_state)) {
     if (timing_active) {
       const uint32_t elapsed_ms = millis() - started_ms;
       *scanner_runtime_context.last_full_sweep_ms = elapsed_ms;
       (*scanner_runtime_context.sweep_cycles_completed)++;
-      scannerSerialPrintfTry("Completed full 2.4G + 5G sweep in %lums\n",
+      scannerSerialPrintfTry("Completed full 2.4G + 5G coverage cycle in %lums\n",
                              (unsigned long)elapsed_ms);
       timing_active = false;
       return;
     }
-    scannerSerialPrintlnTry("Completed full 2.4G + 5G sweep");
+    scannerSerialPrintlnTry("Completed full 2.4G + 5G coverage cycle");
   }
 }
 
@@ -483,20 +455,15 @@ static bool scannerGetResult(WiFiResultPacket& pkt) {
 }
 
 static void startScanForCurrentChannel(uint8_t slot,
-                                       size_t& sweep_band_index,
-                                       size_t& sweep_channel_index,
+                                       ChannelScheduleState& schedule_state,
                                        bool& sweep_timing_active,
                                        uint32_t& sweep_started_ms) {
-  // Every slot draws work from the same shared channel cursor. A slot that
-  // successfully starts a scan advances the global sweep for the next slot.
-  const uint8_t band = (sweep_band_index == 0) ? 2 : 5;
-  const uint8_t channel = (sweep_band_index == 0)
-    ? CHANNELS_24G[sweep_channel_index]
-    : CHANNELS_5G[sweep_channel_index];
-  sweepTimingNoteStart(sweep_band_index,
-                       sweep_channel_index,
-                       sweep_timing_active,
-                       sweep_started_ms);
+  // Every slot draws work from the same shared dispatch plan. A slot that
+  // successfully starts a scan advances the global plan for the next slot.
+  const ChannelScheduleEntry scheduled = channelScheduleCurrent(schedule_state);
+  const uint8_t band = scheduled.band;
+  const uint8_t channel = scheduled.channel;
+  sweepTimingNoteStart(sweep_timing_active, sweep_started_ms);
 
   const int8_t status = scannerQueryStatusWithRetry(CMD_SCAN,
                                                     band,
@@ -510,8 +477,7 @@ static void startScanForCurrentChannel(uint8_t slot,
     scannerSerialPrintfTry("S%u Scan started (band=%u ch=%u)\n",
                            (unsigned)slot, band, channel);
 #endif
-    advanceSweepChannelAndLog(sweep_band_index,
-                              sweep_channel_index,
+    advanceSweepChannelAndLog(schedule_state,
                               sweep_timing_active,
                               sweep_started_ms);
     return;
@@ -521,8 +487,7 @@ static void startScanForCurrentChannel(uint8_t slot,
     // and we missed/garbled the ACK. Advance to avoid re-requesting same channel.
     scannerSerialPrintfTry("S%u Scan already active (band=%u ch=%u); assuming prior start latched\n",
                            (unsigned)slot, band, channel);
-    advanceSweepChannelAndLog(sweep_band_index,
-                              sweep_channel_index,
+    advanceSweepChannelAndLog(schedule_state,
                               sweep_timing_active,
                               sweep_started_ms);
     return;
@@ -540,8 +505,7 @@ static void startScanForCurrentChannel(uint8_t slot,
       if (c == SCANNER_STATUS_BUSY) {
         scannerSerialPrintfTry("S%u Scan started (band=%u ch=%u) via BUSY confirm\n",
                                (unsigned)slot, band, channel);
-        advanceSweepChannelAndLog(sweep_band_index,
-                                  sweep_channel_index,
+        advanceSweepChannelAndLog(schedule_state,
                                   sweep_timing_active,
                                   sweep_started_ms);
         return;
@@ -553,8 +517,7 @@ static void startScanForCurrentChannel(uint8_t slot,
     // Timeout with no BUSY confirm: move on to avoid getting pinned on one channel.
     scannerSerialPrintfTry("S%u SCAN timeout (band=%u ch=%u); moving on\n",
                            (unsigned)slot, band, channel);
-    advanceSweepChannelAndLog(sweep_band_index,
-                              sweep_channel_index,
+    advanceSweepChannelAndLog(schedule_state,
                               sweep_timing_active,
                               sweep_started_ms);
     return;
@@ -563,8 +526,7 @@ static void startScanForCurrentChannel(uint8_t slot,
   // Unexpected scan status: move on to the next channel.
   scannerSerialPrintfTry("S%u SCAN unexpected status=%d (band=%u ch=%u); moving on\n",
                          (unsigned)slot, status, band, channel);
-  advanceSweepChannelAndLog(sweep_band_index,
-                            sweep_channel_index,
+  advanceSweepChannelAndLog(schedule_state,
                             sweep_timing_active,
                             sweep_started_ms);
 }
@@ -576,8 +538,7 @@ static void startScanForCurrentChannel(uint8_t slot,
 // 4) If >0 -> drain that many packets and enqueue uniques.
 static void processScannerSlot(uint8_t slot,
                                ScannerSlotState& slot_state,
-                               size_t& sweep_band_index,
-                               size_t& sweep_channel_index,
+                               ChannelScheduleState& schedule_state,
                                bool& sweep_timing_active,
                                uint32_t& sweep_started_ms) {
   // Each service pass handles one slot only. This keeps the round-robin fair
@@ -663,8 +624,7 @@ static void processScannerSlot(uint8_t slot,
     // Unexpected status: advance global scheduler so one bad slot does not stall coverage.
     scannerSerialPrintfTry("S%u RESULT_COUNT unexpected=%d; moving on\n",
                            (unsigned)slot, count);
-    advanceSweepChannelAndLog(sweep_band_index,
-                              sweep_channel_index,
+    advanceSweepChannelAndLog(schedule_state,
                               sweep_timing_active,
                               sweep_started_ms);
     return;
@@ -673,8 +633,7 @@ static void processScannerSlot(uint8_t slot,
   // No results pending: request next scan from the global scheduler.
   if (count == 0) {
     startScanForCurrentChannel(slot,
-                               sweep_band_index,
-                               sweep_channel_index,
+                               schedule_state,
                                sweep_timing_active,
                                sweep_started_ms);
     return;
@@ -802,8 +761,7 @@ void controllerScannerRuntimeRun(const ControllerScannerRuntimeContext& context)
     if (ensureScannerSlotIdentity(scanner_slot, scanner_slot_state[scanner_slot])) {
       processScannerSlot(scanner_slot,
                          scanner_slot_state[scanner_slot],
-                         scanner_sweep_band_index,
-                         scanner_sweep_channel_index,
+                         scanner_schedule_state,
                          scanner_sweep_timing_active,
                          scanner_sweep_started_ms);
     }
