@@ -19,7 +19,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install PlatformIO
-        run: python -m pip install --upgrade platformio
+        run: python -m pip install --upgrade "platformio==6.1.19"
 
       - name: Create CI local config
         run: |
