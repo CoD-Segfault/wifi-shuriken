@@ -44,6 +44,8 @@ static uint32_t serial_msg_drops = 0;
 static uint32_t dedupe_drops = 0;
 static volatile uint32_t sweep_cycles_completed = 0;
 static volatile uint32_t last_full_sweep_ms = 0;
+static uint32_t last_reported_scan_queue_drops = 0;
+static uint32_t last_reported_dedupe_drops = 0;
 
 // Controller-wide dedupe storage used to suppress duplicate results arriving
 // from different scanner slots during the same operating session.
@@ -161,6 +163,19 @@ static void serialPrintRuntimeStatus() {
                          (unsigned long)last_full_sweep_ms);
 }
 
+static void reportScannerDropCounters() {
+  if (scan_queue_drops != last_reported_scan_queue_drops) {
+    serialPrintfNormalized("Warning: scan queue drops increased to %lu\n",
+                           (unsigned long)scan_queue_drops);
+    last_reported_scan_queue_drops = scan_queue_drops;
+  }
+  if (dedupe_drops != last_reported_dedupe_drops) {
+    serialPrintfNormalized("Notice: dedupe drops increased to %lu\n",
+                           (unsigned long)dedupe_drops);
+    last_reported_dedupe_drops = dedupe_drops;
+  }
+}
+
 static void printPeriodicStatus(bool usable_fix) {
   static uint32_t lastStatMs = 0;
 #if PERIODIC_STATUS_INTERVAL_MS == 0
@@ -174,6 +189,39 @@ static void printPeriodicStatus(bool usable_fix) {
   lastStatMs = now;
   serialPrintRuntimeStatus();
   controllerGnssRuntimeSerialPrintStatus(gps, usable_fix, serialPrintfNormalized);
+#endif
+}
+
+static void maybeRequestDedupeResetOnFixAcquire(bool usable_fix) {
+#if !CONTROLLER_DEDUPE_RESET_ON_FIX_ACQUIRE
+  (void)usable_fix;
+  return;
+#else
+  static bool last_usable_fix = false;
+  static bool reset_requested_once = false;
+  static uint32_t last_reset_request_ms = 0;
+
+  const bool fix_acquired = usable_fix && !last_usable_fix;
+  last_usable_fix = usable_fix;
+  if (!fix_acquired) {
+    return;
+  }
+
+  const uint32_t now = millis();
+  const bool cooldown_active =
+      reset_requested_once &&
+      CONTROLLER_DEDUPE_RESET_COOLDOWN_MS > 0 &&
+      ((int32_t)(now - last_reset_request_ms) <
+       (int32_t)CONTROLLER_DEDUPE_RESET_COOLDOWN_MS);
+  if (cooldown_active) {
+    return;
+  }
+
+  controllerScannerRuntimeRequestDedupeReset();
+  last_reset_request_ms = now;
+  reset_requested_once = true;
+  serialPrintfNormalized("GNSS usable fix acquired; requested dedupe reset (cooldown=%lums)\n",
+                         (unsigned long)CONTROLLER_DEDUPE_RESET_COOLDOWN_MS);
 #endif
 }
 
@@ -251,8 +299,8 @@ void setup() {
   }
   // Queue capacities are sized to tolerate short bursts from core1 while core0
   // is busy with SD or GNSS work.
-  queue_init(&scan_result_queue, sizeof(QueuedScanResult), 128);
-  queue_init(&serial_msg_queue, sizeof(QueuedSerialMsg), 64);
+  queue_init(&scan_result_queue, sizeof(QueuedScanResult), SCAN_RESULT_QUEUE_DEPTH);
+  queue_init(&serial_msg_queue, sizeof(QueuedSerialMsg), SERIAL_MSG_QUEUE_DEPTH);
   wifiDedupeTableInit(&master_dedupe_table, master_dedupe_storage, MASTER_DEDUPE_CAPACITY);
   wifiDedupeTableReset(&master_dedupe_table);
 
@@ -311,12 +359,14 @@ void loop() {
   // Read GNSS data, update the fix LED, and compute the current "usable fix"
   // state that drives logging and periodic status.
   const bool usable_fix = controllerGnssRuntimeService(gps, pixels, CONTROLLER_GPS_FIELD_MAX_AGE_MS);
+  maybeRequestDedupeResetOnFixAcquire(usable_fix);
   logging.syncMasterClockFromGnss();
 
   // Drain core1 serial messages via queue (caps work per iteration).
   QueuedSerialMsg sm = {};
   int serial_drained = 0;
-  while (serial_drained < 16 && queue_try_remove(&serial_msg_queue, &sm)) {
+  while (serial_drained < CONTROLLER_SERIAL_MSG_DRAIN_PER_LOOP &&
+         queue_try_remove(&serial_msg_queue, &sm)) {
     streamWriteNormalized(Serial, sm.text);
     serial_drained++;
   }
@@ -325,10 +375,12 @@ void loop() {
   QueuedScanResult q = {};
   // Limit per-iteration SD writes so GNSS parsing is serviced frequently.
   int drained = 0;
-  while (drained < 16 && queue_try_remove(&scan_result_queue, &q)) {
+  while (drained < CONTROLLER_SCAN_RESULT_DRAIN_PER_LOOP &&
+         queue_try_remove(&scan_result_queue, &q)) {
     logging.appendCsvRow(q);
     drained++;
   }
+  reportScannerDropCounters();
   // Time-based flush closes the durability gap between row-count flushes.
   logging.flushCsvIfDue();
 

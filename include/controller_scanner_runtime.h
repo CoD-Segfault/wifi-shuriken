@@ -25,5 +25,9 @@ struct ControllerScannerRuntimeContext {
 // Initialize the SPI1 bus and any scanner CS hardware.
 void controllerScannerRuntimeInitBus();
 
+// Request a controller-wide dedupe reset from core0. Core1 applies the reset
+// to the master dedupe table and re-arms per-scanner dedupe handshakes.
+void controllerScannerRuntimeRequestDedupeReset();
+
 // Run the scanner service loop on core1 forever.
 void controllerScannerRuntimeRun(const ControllerScannerRuntimeContext& context);

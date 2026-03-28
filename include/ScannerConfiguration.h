@@ -35,7 +35,7 @@
 
 // Scanner debug logging.
 #ifndef SCANNER_SERIAL_LOG
-#define SCANNER_SERIAL_LOG 0  // 1 enables scanner serial status/progress logging.
+#define SCANNER_SERIAL_LOG 1  // 1 enables scanner serial status/progress logging.
 #endif
 #ifndef DEBUG_SPI_PROTOCOL
 #define DEBUG_SPI_PROTOCOL 0  // 1 enables verbose SPI protocol tracing.

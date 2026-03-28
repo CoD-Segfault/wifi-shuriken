@@ -24,16 +24,17 @@ static constexpr size_t SCANNER_FRAME_SIZE = SPI_FRAME_SIZE;
 static constexpr uint32_t SCANNER_SPI_HZ = SCANNER_SPI_CLOCK;
 static constexpr size_t SCANNER_FRAME_TAG_INDEX = SPI_FRAME_TAG_INDEX;
 static constexpr uint8_t SCANNER_SCAN_RESPONSE_PULLS = 24;
-// Keep RESULT_GET pulls relatively high; result packets are larger and may need extra drains.
-static constexpr uint8_t SCANNER_RESULT_RESPONSE_PULLS = 32;
-// Bound per-slot drain work so one scanner cannot monopolize loop time.
-static constexpr uint8_t SCANNER_RESULT_DRAIN_BUDGET = 8;
+// RESULT_GET replies should normally be ready on the very next pull; keep the
+// worst-case wait bounded so result-heavy scans do not feel hung.
+static constexpr uint8_t SCANNER_RESULT_RESPONSE_PULLS = 8;
+// Let a slot drain a little deeper each pass so buffered results clear faster.
+static constexpr uint8_t SCANNER_RESULT_DRAIN_BUDGET = 16;
 // Fast-fail status polling so one missing slot does not stall the round-robin scheduler.
 static constexpr uint8_t SCANNER_RESULT_COUNT_RESPONSE_PULLS = 8;
 static constexpr uint8_t SCANNER_SCAN_CMD_RETRIES = 1;
 static constexpr uint8_t SCANNER_QUERY_CMD_RETRIES = 2;
 static constexpr uint8_t SCANNER_RESULT_COUNT_CMD_RETRIES = 1;
-static constexpr uint8_t SCANNER_RESULT_GET_CMD_RETRIES = 1;
+static constexpr uint8_t SCANNER_RESULT_GET_CMD_RETRIES = 2;
 // Keep a short guard gap after CMD_SCAN before the first response pull.
 static constexpr uint16_t SCANNER_SCAN_FIRST_PULL_US = 3000;
 static constexpr uint8_t SCANNER_SCAN_BUSY_CONFIRM_POLLS = 1;
@@ -54,6 +55,7 @@ static constexpr uint8_t SCANNER_SLOT_TIMEOUT_REPROBE_THRESHOLD = 8;
 static constexpr uint16_t SCANNER_SLOT_TIMEOUT_BACKOFF_BASE_MS = 10;
 static constexpr uint16_t SCANNER_SLOT_TIMEOUT_BACKOFF_MAX_MS = 200;
 static constexpr uint16_t SCANNER_DEDUPE_RESET_RETRY_MS = 100;
+static constexpr uint8_t SCANNER_DEDUPE_RESET_MAX_ATTEMPTS = 3;
 #if SCANNER_USE_SHIFTREG_CS
 static constexpr uint8_t SCANNER_SLOT_COUNT = SCANNER_SHIFTREG_OUTPUTS;
 #else
@@ -74,6 +76,12 @@ struct ScannerSlotState {
   // One-time per-identification scanner dedupe reset handshake.
   bool dedupe_reset_done;
   uint32_t next_dedupe_reset_ms;
+  uint8_t dedupe_reset_failures;
+  // Runtime dedupe resets are deferred until the slot is idle so they do not
+  // preempt normal scan/result transport after GNSS lock transitions.
+  bool runtime_dedupe_reset_pending;
+  uint32_t next_runtime_dedupe_reset_ms;
+  uint8_t runtime_dedupe_reset_failures;
   // Transport timeout streak for targeted stale-frame draining.
   uint8_t transport_timeouts;
 };
@@ -83,6 +91,7 @@ struct ScannerSlotState {
 static ControllerScannerRuntimeContext scanner_runtime_context = {};
 static uint8_t scanner_cs_shiftreg_state = 0xFF;
 static uint8_t scanner_active_slot = SCANNER_INITIAL_SLOT;
+static volatile bool scanner_dedupe_reset_requested = false;
 #if SCANNER_USE_SHIFTREG_CS
 static bool scanner_shiftreg_outputs_enabled = false;
 #endif
@@ -122,6 +131,10 @@ static void scannerSerialPrintfTry(const char* fmt, ...) {
   va_end(args);
   scannerSerialQueueTry(buf);
 #endif
+}
+
+void controllerScannerRuntimeRequestDedupeReset() {
+  scanner_dedupe_reset_requested = true;
 }
 
 // Sweep timing starts with the first scheduled channel after the previous
@@ -270,6 +283,25 @@ static void scannerDrainStaleFrames(int pulls = 4) {
   }
 }
 
+static void handlePendingDedupeResetRequest() {
+  if (!scanner_dedupe_reset_requested) {
+    return;
+  }
+  scanner_dedupe_reset_requested = false;
+
+  if (scanner_runtime_context.master_dedupe_table != nullptr) {
+    wifiDedupeTableReset(scanner_runtime_context.master_dedupe_table);
+  }
+
+  for (uint8_t slot = 0; slot < SCANNER_SLOT_COUNT; slot++) {
+    ScannerSlotState& state = scanner_slot_state[slot];
+    state.runtime_dedupe_reset_pending = true;
+    state.next_runtime_dedupe_reset_ms = 0;
+  }
+
+  scannerSerialPrintlnTry("Controller dedupe reset requested (deferred until slot idle)");
+}
+
 void controllerScannerRuntimeInitBus() {
   // Bring the scanner bus to a safe idle state before core1 starts polling.
 #if SCANNER_USE_SHIFTREG_CS
@@ -337,6 +369,10 @@ static bool ensureScannerSlotIdentity(uint8_t slot, ScannerSlotState& state) {
     state.next_service_ms = 0;
     state.dedupe_reset_done = false;
     state.next_dedupe_reset_ms = 0;
+    state.dedupe_reset_failures = 0;
+    state.runtime_dedupe_reset_pending = false;
+    state.next_runtime_dedupe_reset_ms = 0;
+    state.runtime_dedupe_reset_failures = 0;
     state.transport_timeouts = 0;
     state.next_probe_ms = now + SCANNER_SLOT_REPROBE_MS;
     if (!state.miss_logged) {
@@ -358,6 +394,10 @@ static bool ensureScannerSlotIdentity(uint8_t slot, ScannerSlotState& state) {
     state.next_service_ms = 0;
     state.dedupe_reset_done = false;
     state.next_dedupe_reset_ms = 0;
+    state.dedupe_reset_failures = 0;
+    state.runtime_dedupe_reset_pending = false;
+    state.next_runtime_dedupe_reset_ms = 0;
+    state.runtime_dedupe_reset_failures = 0;
     state.transport_timeouts = 0;
     state.next_probe_ms = now + SCANNER_SLOT_REPROBE_MS;
     if (!state.unsupported_logged) {
@@ -374,6 +414,10 @@ static bool ensureScannerSlotIdentity(uint8_t slot, ScannerSlotState& state) {
   state.next_service_ms = 0;
   state.dedupe_reset_done = false;
   state.next_dedupe_reset_ms = 0;
+  state.dedupe_reset_failures = 0;
+  state.runtime_dedupe_reset_pending = false;
+  state.next_runtime_dedupe_reset_ms = 0;
+  state.runtime_dedupe_reset_failures = 0;
   state.next_probe_ms = 0;
   state.unsupported_logged = false;
   scannerSerialPrintfTry("S%u scanner ready: proto=%u type=%u caps=0x%02X max=%u\n",
@@ -567,15 +611,27 @@ static void processScannerSlot(uint8_t slot,
     if (reset_status == SCANNER_STATUS_OK) {
       slot_state.dedupe_reset_done = true;
       slot_state.next_dedupe_reset_ms = 0;
+      slot_state.dedupe_reset_failures = 0;
       slot_state.transport_timeouts = 0;
       slot_state.next_service_ms = 0;
       scannerSerialPrintfTry("S%u scanner dedupe reset\n", (unsigned)slot);
       scannerDrainStaleFrames(1);
     } else {
+      if (slot_state.dedupe_reset_failures < 0xFF) {
+        slot_state.dedupe_reset_failures++;
+      }
       slot_state.next_dedupe_reset_ms = now + SCANNER_DEDUPE_RESET_RETRY_MS;
       if (reset_status == SCANNER_STATUS_TRANSPORT_TIMEOUT &&
           slot_state.transport_timeouts < 0x0F) {
         slot_state.transport_timeouts++;
+      }
+      if (slot_state.dedupe_reset_failures >= SCANNER_DEDUPE_RESET_MAX_ATTEMPTS) {
+        slot_state.dedupe_reset_done = true;
+        slot_state.next_dedupe_reset_ms = 0;
+        slot_state.dedupe_reset_failures = 0;
+        scannerSerialPrintfTry("S%u scanner dedupe reset failed status=%d; continuing without reset\n",
+                               (unsigned)slot,
+                               reset_status);
       }
       return;
     }
@@ -632,6 +688,47 @@ static void processScannerSlot(uint8_t slot,
 
   // No results pending: request next scan from the global scheduler.
   if (count == 0) {
+    if (slot_state.runtime_dedupe_reset_pending) {
+      if ((int32_t)(now - slot_state.next_runtime_dedupe_reset_ms) < 0) {
+        return;
+      }
+
+      const int8_t reset_status = scannerQueryStatusWithRetry(CMD_DEDUPE_RESET,
+                                                              0,
+                                                              0,
+                                                              SCANNER_RESULT_COUNT_RESPONSE_PULLS,
+                                                              SCANNER_QUERY_CMD_RETRIES,
+                                                              SCANNER_STATUS_BUSY,
+                                                              SCANNER_STATUS_OK);
+      if (reset_status == SCANNER_STATUS_OK) {
+        slot_state.runtime_dedupe_reset_pending = false;
+        slot_state.next_runtime_dedupe_reset_ms = 0;
+        slot_state.runtime_dedupe_reset_failures = 0;
+        slot_state.transport_timeouts = 0;
+        slot_state.next_service_ms = 0;
+        scannerSerialPrintfTry("S%u runtime dedupe reset\n", (unsigned)slot);
+        scannerDrainStaleFrames(1);
+      } else {
+        if (slot_state.runtime_dedupe_reset_failures < 0xFF) {
+          slot_state.runtime_dedupe_reset_failures++;
+        }
+        slot_state.next_runtime_dedupe_reset_ms = now + SCANNER_DEDUPE_RESET_RETRY_MS;
+        if (reset_status == SCANNER_STATUS_TRANSPORT_TIMEOUT &&
+            slot_state.transport_timeouts < 0x0F) {
+          slot_state.transport_timeouts++;
+        }
+        if (slot_state.runtime_dedupe_reset_failures >= SCANNER_DEDUPE_RESET_MAX_ATTEMPTS) {
+          slot_state.runtime_dedupe_reset_pending = false;
+          slot_state.next_runtime_dedupe_reset_ms = 0;
+          slot_state.runtime_dedupe_reset_failures = 0;
+          scannerSerialPrintfTry("S%u runtime dedupe reset failed status=%d; continuing without reset\n",
+                                 (unsigned)slot,
+                                 reset_status);
+        }
+      }
+      return;
+    }
+
     startScanForCurrentChannel(slot,
                                schedule_state,
                                sweep_timing_active,
@@ -756,6 +853,7 @@ void controllerScannerRuntimeRun(const ControllerScannerRuntimeContext& context)
 #endif
 
   while (true) {
+    handlePendingDedupeResetRequest();
     // Each iteration services exactly one slot; round-robin when shift-reg CS is enabled.
     scannerSetActiveSlot(scanner_slot);
     if (ensureScannerSlotIdentity(scanner_slot, scanner_slot_state[scanner_slot])) {

@@ -46,6 +46,7 @@ static constexpr uint16_t PASSIVE_DWELL_MS = 210;
 static constexpr uint8_t BAND_5_GHZ = 5;
 static constexpr uint16_t SPI_RX_TIMEOUT_MS = 50;
 static constexpr uint8_t SPI_TRANSACTION_QUEUE_SIZE = 4;
+static constexpr uint8_t SCAN_RESULT_PROCESS_BUDGET = 16;
 
 // ---------- Fixed SPI frame size ----------
 // Keep a fixed frame size for all transactions (simplifies master & DMA alignment).
@@ -224,7 +225,7 @@ static void logDedupeSuppressedSummary() {
 }
 #endif
 
-static void process_scan_results_into_spi_buffer(int budget = 4) {
+static void process_scan_results_into_spi_buffer(int budget = SCAN_RESULT_PROCESS_BUDGET) {
   if (scan_phase != ScanPhase::Processing) {
     return;
   }

@@ -144,6 +144,22 @@
 #define CORE1_SERIAL_LOG 1  // 1 enables core1 diagnostic queue logging.
 #endif
 
+// Cross-core queue sizing and per-loop drain limits. Larger values reduce
+// drops during dense scans or multi-scanner bursts at the cost of more RAM and
+// longer core0 drain slices.
+#ifndef SCAN_RESULT_QUEUE_DEPTH
+#define SCAN_RESULT_QUEUE_DEPTH 512
+#endif
+#ifndef SERIAL_MSG_QUEUE_DEPTH
+#define SERIAL_MSG_QUEUE_DEPTH 64
+#endif
+#ifndef CONTROLLER_SCAN_RESULT_DRAIN_PER_LOOP
+#define CONTROLLER_SCAN_RESULT_DRAIN_PER_LOOP 64
+#endif
+#ifndef CONTROLLER_SERIAL_MSG_DRAIN_PER_LOOP
+#define CONTROLLER_SERIAL_MSG_DRAIN_PER_LOOP 16
+#endif
+
 // Periodic runtime/GPS status print interval in milliseconds.
 // Set to 0 to disable the periodic summary lines entirely.
 #ifndef PERIODIC_STATUS_INTERVAL_MS
@@ -165,6 +181,16 @@
 // suppressed summary still follows LOG_DEDUPE_HITS.
 #ifndef CONTROLLER_LOG_INDIVIDUAL_DEDUPE_HITS
 #define CONTROLLER_LOG_INDIVIDUAL_DEDUPE_HITS 0
+#endif
+
+// Reset controller/scanner dedupe state when GNSS transitions from no usable
+// fix to a usable location lock. A cooldown prevents repeated resets if the
+// lock flaps.
+#ifndef CONTROLLER_DEDUPE_RESET_ON_FIX_ACQUIRE
+#define CONTROLLER_DEDUPE_RESET_ON_FIX_ACQUIRE 1
+#endif
+#ifndef CONTROLLER_DEDUPE_RESET_COOLDOWN_MS
+#define CONTROLLER_DEDUPE_RESET_COOLDOWN_MS 15000
 #endif
 
 // SPI delay between command and follow-up polling frame in microseconds.
