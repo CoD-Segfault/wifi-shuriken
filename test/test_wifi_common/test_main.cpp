@@ -28,6 +28,15 @@ static WiFiDedupeHash makeHash(uint8_t seed) {
   return hash;
 }
 
+// Helper: initialise a small table for testing. table_size must be a power of
+// two and at least 2x capacity; slots and fifo must have table_size and
+// capacity entries respectively.
+static void initSmallTable(WiFiDedupeTable* table,
+                           WiFiDedupeHash* slots, uint16_t table_size,
+                           WiFiDedupeHash* fifo, uint16_t capacity) {
+  wifiDedupeTableInit(table, slots, table_size, fifo, capacity);
+}
+
 void test_wifiBandFromChannel_boundaries() {
   TEST_ASSERT_EQUAL_UINT8(WIFI_BAND_24_GHZ, wifiBandFromChannel(1));
   TEST_ASSERT_EQUAL_UINT8(WIFI_BAND_24_GHZ, wifiBandFromChannel(14));
@@ -114,9 +123,10 @@ void test_wifiDedupeHash_ignores_rssi_field() {
   wifiDedupeHashFromResult(b, hb);
   TEST_ASSERT_TRUE(wifiDedupeHashEquals(ha, hb));
 
-  WiFiDedupeHash storage[8] = {};
+  WiFiDedupeHash slots[16] = {};
+  WiFiDedupeHash fifo[8] = {};
   WiFiDedupeTable table = {};
-  wifiDedupeTableInit(&table, storage, 8);
+  initSmallTable(&table, slots, 16, fifo, 8);
 
   TEST_ASSERT_TRUE(wifiDedupeTableRemember(&table, &ha));
   TEST_ASSERT_FALSE(wifiDedupeTableRemember(&table, &hb));
@@ -154,9 +164,10 @@ void test_wifiDedupeHash_changes_when_identity_fields_change() {
 }
 
 void test_wifiDedupeTable_remember_contains_and_duplicate() {
-  WiFiDedupeHash storage[4] = {};
+  WiFiDedupeHash slots[8] = {};
+  WiFiDedupeHash fifo[4] = {};
   WiFiDedupeTable table = {};
-  wifiDedupeTableInit(&table, storage, 4);
+  initSmallTable(&table, slots, 8, fifo, 4);
 
   const WiFiDedupeHash h1 = makeHash(1);
   TEST_ASSERT_TRUE(wifiDedupeTableRemember(&table, &h1));
@@ -168,9 +179,10 @@ void test_wifiDedupeTable_remember_contains_and_duplicate() {
 }
 
 void test_wifiDedupeTable_ring_overwrite_when_full() {
-  WiFiDedupeHash storage[2] = {};
+  WiFiDedupeHash slots[4] = {};
+  WiFiDedupeHash fifo[2] = {};
   WiFiDedupeTable table = {};
-  wifiDedupeTableInit(&table, storage, 2);
+  initSmallTable(&table, slots, 4, fifo, 2);
 
   const WiFiDedupeHash h1 = makeHash(10);
   const WiFiDedupeHash h2 = makeHash(30);
@@ -187,12 +199,15 @@ void test_wifiDedupeTable_ring_overwrite_when_full() {
 }
 
 void test_wifiDedupeTable_corrupt_metadata_guard() {
-  WiFiDedupeHash storage[2] = {};
+  WiFiDedupeHash slots[4] = {};
+  WiFiDedupeHash fifo[2] = {};
   WiFiDedupeTable table = {};
-  wifiDedupeTableInit(&table, storage, 2);
+  initSmallTable(&table, slots, 4, fifo, 2);
 
+  // Corrupt both count and FIFO indices beyond capacity.
   table.count = 99;
-  table.write_index = 99;
+  table.fifo_head = 99;
+  table.fifo_tail = 99;
 
   const WiFiDedupeHash h = makeHash(90);
   TEST_ASSERT_TRUE(wifiDedupeTableRemember(&table, &h));
@@ -200,9 +215,10 @@ void test_wifiDedupeTable_corrupt_metadata_guard() {
 }
 
 void test_wifiDedupeTable_reset_clears_state() {
-  WiFiDedupeHash storage[3] = {};
+  WiFiDedupeHash slots[8] = {};
+  WiFiDedupeHash fifo[3] = {};
   WiFiDedupeTable table = {};
-  wifiDedupeTableInit(&table, storage, 3);
+  initSmallTable(&table, slots, 8, fifo, 3);
 
   const WiFiDedupeHash h1 = makeHash(7);
   const WiFiDedupeHash h2 = makeHash(11);
@@ -212,7 +228,8 @@ void test_wifiDedupeTable_reset_clears_state() {
 
   wifiDedupeTableReset(&table);
   TEST_ASSERT_EQUAL_UINT16(0, table.count);
-  TEST_ASSERT_EQUAL_UINT16(0, table.write_index);
+  TEST_ASSERT_EQUAL_UINT16(0, table.fifo_head);
+  TEST_ASSERT_EQUAL_UINT16(0, table.fifo_tail);
   TEST_ASSERT_FALSE(wifiDedupeTableContains(&table, &h1));
   TEST_ASSERT_FALSE(wifiDedupeTableContains(&table, &h2));
 }
@@ -225,6 +242,44 @@ void test_wifiDedupeTable_invalid_inputs() {
   TEST_ASSERT_FALSE(wifiDedupeTableContains(&invalid, &h));
   TEST_ASSERT_FALSE(wifiDedupeTableRemember(nullptr, &h));
   TEST_ASSERT_FALSE(wifiDedupeTableRemember(&invalid, &h));
+}
+
+// makeHash(seed) produces bytes {seed, seed+1, seed+2, ...}. On little-endian
+// hosts the first two bytes are read as (seed + (seed+1)*256). For seed values
+// 0, 8, 16, 24 this index is divisible by 8, so all four map to slot 0 in an
+// 8-slot table (mask=7). This exercises linear probing and backward-shift
+// deletion with a fully colliding probe chain.
+void test_wifiDedupeTable_collision_probe_chain() {
+  // All four hashes map to slot 0 in an 8-slot table: on little-endian hosts
+  // hashToSlot reads the first two bytes as a uint16_t. For makeHash(N),
+  // bytes[0..1] = {N, N+1}, so idx = N + (N+1)*256. For N = 0,8,16,24 this
+  // value is always divisible by 8 (mask=7 → slot 0).
+  //
+  // Capacity=3 means the 4th insert triggers eviction of h1, exercising
+  // backward-shift deletion across a fully colliding probe chain.
+  WiFiDedupeHash slots[8] = {};
+  WiFiDedupeHash fifo[3] = {};
+  WiFiDedupeTable table = {};
+  initSmallTable(&table, slots, 8, fifo, 3);
+
+  const WiFiDedupeHash h1 = makeHash(0);   // natural slot 0
+  const WiFiDedupeHash h2 = makeHash(8);   // natural slot 0 (collides)
+  const WiFiDedupeHash h3 = makeHash(16);  // natural slot 0 (collides)
+
+  TEST_ASSERT_TRUE(wifiDedupeTableRemember(&table, &h1));
+  TEST_ASSERT_TRUE(wifiDedupeTableRemember(&table, &h2));
+  TEST_ASSERT_TRUE(wifiDedupeTableRemember(&table, &h3));
+  TEST_ASSERT_EQUAL_UINT16(3, table.count);
+
+  // h4 triggers eviction of h1 (count == capacity). Backward-shift deletion
+  // must repair the probe chain so h2 and h3 remain findable.
+  const WiFiDedupeHash h4 = makeHash(24);  // natural slot 0 (collides)
+  TEST_ASSERT_TRUE(wifiDedupeTableRemember(&table, &h4));
+  TEST_ASSERT_FALSE(wifiDedupeTableContains(&table, &h1));
+  TEST_ASSERT_TRUE(wifiDedupeTableContains(&table, &h2));
+  TEST_ASSERT_TRUE(wifiDedupeTableContains(&table, &h3));
+  TEST_ASSERT_TRUE(wifiDedupeTableContains(&table, &h4));
+  TEST_ASSERT_EQUAL_UINT16(3, table.count);
 }
 
 int main(int argc, char** argv) {
@@ -245,5 +300,6 @@ int main(int argc, char** argv) {
   RUN_TEST(test_wifiDedupeTable_corrupt_metadata_guard);
   RUN_TEST(test_wifiDedupeTable_reset_clears_state);
   RUN_TEST(test_wifiDedupeTable_invalid_inputs);
+  RUN_TEST(test_wifiDedupeTable_collision_probe_chain);
   return UNITY_END();
 }

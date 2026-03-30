@@ -84,7 +84,8 @@ static uint8_t spi_result_index = 0;
 static int8_t spi_status = SCANNER_STATUS_OK;
 static uint8_t last_scan_band = 0;
 static uint8_t last_scan_channel = 0;
-static WiFiDedupeHash scan_dedupe_storage[WIFI_DEDUPE_TABLE_CAPACITY];
+static WiFiDedupeHash scan_dedupe_slots[WIFI_DEDUPE_TABLE_SIZE];
+static WiFiDedupeHash scan_dedupe_fifo[WIFI_DEDUPE_TABLE_CAPACITY];
 static WiFiDedupeTable scan_dedupe_table = {};
 #if LOG_DEDUPE_HITS
 static uint32_t scan_dedupe_hits = 0;
@@ -515,7 +516,9 @@ void setup() {
 
   memset(rx_buf, 0, FRAME_SIZE);
   memset(tx_buf, 0, FRAME_SIZE);
-  wifiDedupeTableInit(&scan_dedupe_table, scan_dedupe_storage, WIFI_DEDUPE_TABLE_CAPACITY);
+  wifiDedupeTableInit(&scan_dedupe_table,
+                      scan_dedupe_slots, WIFI_DEDUPE_TABLE_SIZE,
+                      scan_dedupe_fifo, WIFI_DEDUPE_TABLE_CAPACITY);
   resetDedupeAndBuffers();
 
   // Boot complete: scanner is ready/idle.

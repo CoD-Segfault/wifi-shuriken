@@ -41,68 +41,136 @@ bool wifiDedupeHashEquals(const WiFiDedupeHash& a, const WiFiDedupeHash& b) {
   return memcmp(a.bytes, b.bytes, WIFI_DEDUPE_HASH_SIZE) == 0;
 }
 
-void wifiDedupeTableInit(WiFiDedupeTable* table, WiFiDedupeHash* entries, uint16_t capacity) {
-  if (!table) {
-    return;
+// Returns true if the slot contains the empty sentinel (all-zero bytes).
+static bool slotIsEmpty(const WiFiDedupeHash* h) {
+  for (size_t i = 0; i < WIFI_DEDUPE_HASH_SIZE; i++) {
+    if (h->bytes[i] != 0) return false;
   }
-  table->entries = entries;
+  return true;
+}
+
+// Maps a hash to its initial probe slot using the first two bytes as an index.
+// table_size must be a power of 2.
+static uint16_t hashToSlot(const WiFiDedupeHash* h, uint16_t table_size) {
+  uint16_t idx = 0;
+  memcpy(&idx, h->bytes, sizeof(idx));
+  return (uint16_t)(idx & (uint16_t)(table_size - 1u));
+}
+
+// Removes the entry at `removed` and shifts subsequent entries in the same
+// probe chain back toward their natural positions. Leaves no tombstones.
+static void backwardShiftDelete(WiFiDedupeHash* slots,
+                                uint16_t table_size,
+                                uint16_t removed) {
+  const uint16_t mask = (uint16_t)(table_size - 1u);
+  memset(&slots[removed], 0, sizeof(WiFiDedupeHash));
+  uint16_t gap = removed;
+  uint16_t scan = (uint16_t)((removed + 1u) & mask);
+  while (!slotIsEmpty(&slots[scan])) {
+    const uint16_t natural = hashToSlot(&slots[scan], table_size);
+    // Move entry from scan to gap if doing so keeps it at or closer to its
+    // natural position (i.e. gap is within the probe chain from natural to scan).
+    const uint16_t dist_to_gap  = (uint16_t)((gap  - natural + table_size) & mask);
+    const uint16_t dist_to_scan = (uint16_t)((scan - natural + table_size) & mask);
+    if (dist_to_gap <= dist_to_scan) {
+      slots[gap] = slots[scan];
+      memset(&slots[scan], 0, sizeof(WiFiDedupeHash));
+      gap = scan;
+    }
+    scan = (uint16_t)((scan + 1u) & mask);
+  }
+}
+
+void wifiDedupeTableInit(WiFiDedupeTable* table,
+                         WiFiDedupeHash* slots, uint16_t table_size,
+                         WiFiDedupeHash* fifo, uint16_t capacity) {
+  if (!table) return;
+  table->slots = slots;
+  table->fifo = fifo;
+  table->table_size = table_size;
   table->capacity = capacity;
   table->count = 0;
-  table->write_index = 0;
-  if (table->entries && table->capacity > 0) {
-    memset(table->entries, 0, (size_t)table->capacity * sizeof(WiFiDedupeHash));
+  table->fifo_head = 0;
+  table->fifo_tail = 0;
+  if (slots && table_size > 0) {
+    memset(slots, 0, (size_t)table_size * sizeof(WiFiDedupeHash));
   }
 }
 
 void wifiDedupeTableReset(WiFiDedupeTable* table) {
-  if (!table) {
-    return;
-  }
+  if (!table) return;
   table->count = 0;
-  table->write_index = 0;
-  if (table->entries && table->capacity > 0) {
-    memset(table->entries, 0, (size_t)table->capacity * sizeof(WiFiDedupeHash));
+  table->fifo_head = 0;
+  table->fifo_tail = 0;
+  if (table->slots && table->table_size > 0) {
+    memset(table->slots, 0, (size_t)table->table_size * sizeof(WiFiDedupeHash));
   }
 }
 
-bool wifiDedupeTableContains(const WiFiDedupeTable* table, const WiFiDedupeHash* hash) {
-  if (!table || !hash || !table->entries || table->capacity == 0) {
-    return false;
-  }
-  const uint16_t count = (table->count <= table->capacity) ? table->count : table->capacity;
-  for (uint16_t i = 0; i < count; i++) {
-    if (memcmp(table->entries[i].bytes, hash->bytes, WIFI_DEDUPE_HASH_SIZE) == 0) {
+bool wifiDedupeTableContains(const WiFiDedupeTable* table,
+                              const WiFiDedupeHash* hash) {
+  if (!table || !hash || !table->slots || table->table_size == 0) return false;
+  // All-zero hashes are used as the empty sentinel and can never be stored.
+  if (slotIsEmpty(hash)) return false;
+  const uint16_t mask = (uint16_t)(table->table_size - 1u);
+  uint16_t slot = hashToSlot(hash, table->table_size);
+  while (!slotIsEmpty(&table->slots[slot])) {
+    if (memcmp(table->slots[slot].bytes, hash->bytes, WIFI_DEDUPE_HASH_SIZE) == 0) {
       return true;
     }
+    slot = (uint16_t)((slot + 1u) & mask);
   }
   return false;
 }
 
 bool wifiDedupeTableRemember(WiFiDedupeTable* table, const WiFiDedupeHash* hash) {
-  if (!table || !hash || !table->entries || table->capacity == 0) {
+  if (!table || !hash || !table->slots || !table->fifo ||
+      table->table_size == 0 || table->capacity == 0) {
     return false;
   }
+  // All-zero hashes collide with the empty sentinel and cannot be stored.
+  if (slotIsEmpty(hash)) return false;
 
-  // Guard against corrupted metadata to avoid out-of-bounds access.
-  if (table->count > table->capacity) {
-    table->count = table->capacity;
-  }
-  if (table->count == table->capacity && table->write_index >= table->capacity) {
-    table->write_index = 0;
-  }
+  // Corruption guard: clamp out-of-range metadata before any access.
+  if (table->count > table->capacity) table->count = table->capacity;
+  if (table->fifo_head >= table->capacity) table->fifo_head = 0;
+  if (table->fifo_tail >= table->capacity) table->fifo_tail = 0;
 
-  if (wifiDedupeTableContains(table, hash)) {
-    return false;
-  }
+  if (wifiDedupeTableContains(table, hash)) return false;
 
-  if (table->count < table->capacity) {
-    table->entries[table->count++] = *hash;
-    if (table->count == table->capacity) {
-      table->write_index = 0;
+  const uint16_t mask = (uint16_t)(table->table_size - 1u);
+
+  if (table->count == table->capacity) {
+    // Evict the oldest entry: retrieve its hash from the FIFO, locate its
+    // current slot via a fresh probe (O(1) expected), then backward-shift delete.
+    const WiFiDedupeHash evict_hash = table->fifo[table->fifo_head];
+    table->fifo_head = (uint16_t)((table->fifo_head + 1u) % table->capacity);
+
+    uint16_t evict_slot = hashToSlot(&evict_hash, table->table_size);
+    while (!slotIsEmpty(&table->slots[evict_slot])) {
+      if (memcmp(table->slots[evict_slot].bytes,
+                 evict_hash.bytes,
+                 WIFI_DEDUPE_HASH_SIZE) == 0) {
+        break;
+      }
+      evict_slot = (uint16_t)((evict_slot + 1u) & mask);
     }
-  } else {
-    table->entries[table->write_index] = *hash;
-    table->write_index = (uint16_t)((table->write_index + 1) % table->capacity);
+    // Guard against FIFO/table desync: only delete if the slot is occupied.
+    if (!slotIsEmpty(&table->slots[evict_slot])) {
+      backwardShiftDelete(table->slots, table->table_size, evict_slot);
+    }
+    table->count--;
   }
+
+  // Find the first empty slot from the natural position.
+  uint16_t insert_slot = hashToSlot(hash, table->table_size);
+  while (!slotIsEmpty(&table->slots[insert_slot])) {
+    insert_slot = (uint16_t)((insert_slot + 1u) & mask);
+  }
+
+  table->slots[insert_slot] = *hash;
+  table->fifo[table->fifo_tail] = *hash;
+  table->fifo_tail = (uint16_t)((table->fifo_tail + 1u) % table->capacity);
+  table->count++;
   return true;
 }

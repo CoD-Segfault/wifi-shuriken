@@ -52,7 +52,8 @@ static uint32_t last_reported_dedupe_drops = 0;
 // Controller-wide dedupe storage used to suppress duplicate results arriving
 // from different scanner slots during the same operating session.
 static constexpr uint16_t MASTER_DEDUPE_CAPACITY = WIFI_DEDUPE_TABLE_CAPACITY;
-static WiFiDedupeHash master_dedupe_storage[MASTER_DEDUPE_CAPACITY];
+static WiFiDedupeHash master_dedupe_slots[WIFI_DEDUPE_TABLE_SIZE];
+static WiFiDedupeHash master_dedupe_fifo[MASTER_DEDUPE_CAPACITY];
 static WiFiDedupeTable master_dedupe_table = {};
 
 // SD/logging retry policy remains owned by controller_main.cpp because the
@@ -304,7 +305,9 @@ void setup() {
   // is busy with SD or GNSS work.
   queue_init(&scan_result_queue, sizeof(QueuedScanResult), SCAN_RESULT_QUEUE_DEPTH);
   queue_init(&serial_msg_queue, sizeof(QueuedSerialMsg), SERIAL_MSG_QUEUE_DEPTH);
-  wifiDedupeTableInit(&master_dedupe_table, master_dedupe_storage, MASTER_DEDUPE_CAPACITY);
+  wifiDedupeTableInit(&master_dedupe_table,
+                      master_dedupe_slots, WIFI_DEDUPE_TABLE_SIZE,
+                      master_dedupe_fifo, MASTER_DEDUPE_CAPACITY);
   wifiDedupeTableReset(&master_dedupe_table);
 
   // Initialize SPI1 for scanner communication
