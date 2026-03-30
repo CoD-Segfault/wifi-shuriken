@@ -148,7 +148,7 @@
 // drops during dense scans or multi-scanner bursts at the cost of more RAM and
 // longer core0 drain slices.
 #ifndef SCAN_RESULT_QUEUE_DEPTH
-#define SCAN_RESULT_QUEUE_DEPTH 512
+#define SCAN_RESULT_QUEUE_DEPTH 1024
 #endif
 #ifndef SERIAL_MSG_QUEUE_DEPTH
 #define SERIAL_MSG_QUEUE_DEPTH 64
