@@ -160,6 +160,13 @@
 #define CONTROLLER_SERIAL_MSG_DRAIN_PER_LOOP 16
 #endif
 
+// Hardware watchdog timeout in milliseconds. Both cores must update their
+// heartbeat timestamps within half this window or the watchdog fires and
+// reboots the controller. Set to 0 to disable the watchdog entirely.
+#ifndef CONTROLLER_WATCHDOG_TIMEOUT_MS
+#define CONTROLLER_WATCHDOG_TIMEOUT_MS 8000
+#endif
+
 // Periodic runtime/GPS status print interval in milliseconds.
 // Set to 0 to disable the periodic summary lines entirely.
 #ifndef PERIODIC_STATUS_INTERVAL_MS

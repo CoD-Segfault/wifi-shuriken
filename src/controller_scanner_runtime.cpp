@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "hardware/gpio.h"
+#include "pico/time.h"
 #include "channel_scheduler.h"
 #include "pico_logging.h"
 #include "spi_protocol_shared.h"
@@ -853,6 +854,10 @@ void controllerScannerRuntimeRun(const ControllerScannerRuntimeContext& context)
 #endif
 
   while (true) {
+    if (scanner_runtime_context.wd_core1_last_ms != nullptr) {
+      *scanner_runtime_context.wd_core1_last_ms =
+          to_ms_since_boot(get_absolute_time());
+    }
     handlePendingDedupeResetRequest();
     // Each iteration services exactly one slot; round-robin when shift-reg CS is enabled.
     scannerSetActiveSlot(scanner_slot);

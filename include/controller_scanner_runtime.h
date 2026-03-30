@@ -20,6 +20,9 @@ struct ControllerScannerRuntimeContext {
   WiFiDedupeTable* master_dedupe_table;
   // Core1 cannot print directly; queue diagnostic lines for core0 instead.
   void (*serial_queue_try)(const char* text);
+  // Watchdog heartbeat: core1 writes the current time (ms) each main loop
+  // iteration so core0 can verify both cores are alive before kicking.
+  volatile uint32_t* wd_core1_last_ms;
 };
 
 // Initialize the SPI1 bus and any scanner CS hardware.
