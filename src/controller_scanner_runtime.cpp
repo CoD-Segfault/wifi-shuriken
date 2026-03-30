@@ -91,7 +91,7 @@ struct ScannerSlotState {
 static ControllerScannerRuntimeContext scanner_runtime_context = {};
 static uint8_t scanner_cs_shiftreg_state = 0xFF;
 static uint8_t scanner_active_slot = SCANNER_INITIAL_SLOT;
-static volatile bool scanner_dedupe_reset_requested = false;
+static bool scanner_dedupe_reset_requested = false;
 #if SCANNER_USE_SHIFTREG_CS
 static bool scanner_shiftreg_outputs_enabled = false;
 #endif
@@ -134,7 +134,7 @@ static void scannerSerialPrintfTry(const char* fmt, ...) {
 }
 
 void controllerScannerRuntimeRequestDedupeReset() {
-  scanner_dedupe_reset_requested = true;
+  __atomic_store_n(&scanner_dedupe_reset_requested, true, __ATOMIC_RELEASE);
 }
 
 // Sweep timing starts with the first scheduled channel after the previous
@@ -284,10 +284,10 @@ static void scannerDrainStaleFrames(int pulls = 4) {
 }
 
 static void handlePendingDedupeResetRequest() {
-  if (!scanner_dedupe_reset_requested) {
+  const bool was_set = __atomic_exchange_n(&scanner_dedupe_reset_requested, false, __ATOMIC_ACQ_REL);
+  if (!was_set) {
     return;
   }
-  scanner_dedupe_reset_requested = false;
 
   if (scanner_runtime_context.master_dedupe_table != nullptr) {
     wifiDedupeTableReset(scanner_runtime_context.master_dedupe_table);
