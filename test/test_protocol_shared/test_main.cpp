@@ -17,6 +17,15 @@ void test_protocol_command_values_are_stable() {
   TEST_ASSERT_EQUAL_UINT8(0x05, CMD_DEDUPE_RESET);
 }
 
+void test_protocol_version_and_capability_values_are_stable() {
+  TEST_ASSERT_EQUAL_UINT8(1, PROTO_VERSION);
+  TEST_ASSERT_EQUAL_UINT8(1, SCANNER_TYPE_ESP32_C5);
+  TEST_ASSERT_EQUAL_UINT8(0x01, CAP_BAND_24GHZ);
+  TEST_ASSERT_EQUAL_UINT8(0x02, CAP_BAND_5GHZ);
+  TEST_ASSERT_EQUAL_UINT8(0x04, CAP_BAND_6GHZ);
+  TEST_ASSERT_EQUAL_UINT8(127, PROTO_MAX_RESULTS);
+}
+
 void test_protocol_result_type_values_are_stable() {
   TEST_ASSERT_EQUAL_UINT8(0x00, RESULT_WIFI);
   TEST_ASSERT_EQUAL_UINT8(0xFD, RESULT_BUSY);
@@ -36,7 +45,9 @@ void test_protocol_frame_contract() {
 }
 
 void test_protocol_struct_layout_and_limits() {
+  TEST_ASSERT_EQUAL_UINT32(44, sizeof(WiFiResult));
   TEST_ASSERT_EQUAL_UINT32(48, sizeof(WiFiResultPacket));
+  TEST_ASSERT_EQUAL_UINT32(4, sizeof(ScanCommand));
   TEST_ASSERT_EQUAL_UINT32(8, sizeof(DeviceIdReply));
   TEST_ASSERT_TRUE(PROTO_MAX_RESULTS <= INT8_MAX);
 }
@@ -71,6 +82,7 @@ int main(int argc, char** argv) {
 
   UNITY_BEGIN();
   RUN_TEST(test_protocol_command_values_are_stable);
+  RUN_TEST(test_protocol_version_and_capability_values_are_stable);
   RUN_TEST(test_protocol_result_type_values_are_stable);
   RUN_TEST(test_protocol_status_values_are_stable);
   RUN_TEST(test_protocol_frame_contract);

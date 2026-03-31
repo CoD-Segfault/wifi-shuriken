@@ -36,11 +36,24 @@ void test_buildAndroidCapabilitiesString_open_and_ess() {
   TEST_ASSERT_EQUAL_STRING("[OPEN][ESS]", out);
 }
 
+void test_buildAndroidCapabilitiesString_wep_and_ess() {
+  char out[96] = {};
+  pico_logging::buildAndroidCapabilitiesString((uint16_t)(CAP_WEP | CAP_ESS), out, sizeof(out));
+  TEST_ASSERT_EQUAL_STRING("[WEP][ESS]", out);
+}
+
 void test_buildAndroidCapabilitiesString_wpa2_psk_ccmp() {
   char out[96] = {};
   const uint16_t caps = (uint16_t)(CAP_WPA2 | CAP_PSK | CAP_CCMP | CAP_ESS);
   pico_logging::buildAndroidCapabilitiesString(caps, out, sizeof(out));
   TEST_ASSERT_EQUAL_STRING("[WPA2-PSK-CCMP][ESS]", out);
+}
+
+void test_buildAndroidCapabilitiesString_wpa3_psk_ccmp_maps_to_rsn() {
+  char out[96] = {};
+  const uint16_t caps = (uint16_t)(CAP_WPA3 | CAP_PSK | CAP_CCMP | CAP_ESS);
+  pico_logging::buildAndroidCapabilitiesString(caps, out, sizeof(out));
+  TEST_ASSERT_EQUAL_STRING("[RSN-PSK-CCMP][ESS]", out);
 }
 
 void test_buildAndroidCapabilitiesString_multi_protocol_eap_combo() {
@@ -106,6 +119,16 @@ void test_buildCsvWifiRow_reports_overflow() {
   TEST_ASSERT_EQUAL_CHAR('\0', out[sizeof(out) - 1]);
 }
 
+void test_buildCsvWifiRow_rejects_missing_output_buffer() {
+  const uint8_t bssid[6] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF};
+  char out[8] = {};
+
+  TEST_ASSERT_FALSE(pico_logging::buildCsvWifiRow(
+      bssid, "SSID", CAP_ESS, "2026-02-28 12:34:56", 149, -20, "1.0", "2.0", "3.0", "4.0", nullptr, sizeof(out)));
+  TEST_ASSERT_FALSE(pico_logging::buildCsvWifiRow(
+      bssid, "SSID", CAP_ESS, "2026-02-28 12:34:56", 149, -20, "1.0", "2.0", "3.0", "4.0", out, 0));
+}
+
 int main(int argc, char** argv) {
   (void)argc;
   (void)argv;
@@ -115,12 +138,14 @@ int main(int argc, char** argv) {
   RUN_TEST(test_csvEscape_quotes_and_escapes_quotes);
   RUN_TEST(test_csvEscape_truncates_safely);
   RUN_TEST(test_buildAndroidCapabilitiesString_open_and_ess);
+  RUN_TEST(test_buildAndroidCapabilitiesString_wep_and_ess);
   RUN_TEST(test_buildAndroidCapabilitiesString_wpa2_psk_ccmp);
+  RUN_TEST(test_buildAndroidCapabilitiesString_wpa3_psk_ccmp_maps_to_rsn);
   RUN_TEST(test_buildAndroidCapabilitiesString_multi_protocol_eap_combo);
   RUN_TEST(test_buildCsvWifiRow_full_line);
   RUN_TEST(test_buildCsvWifiRow_blank_optional_fields);
   RUN_TEST(test_buildCsvWifiRow_null_inputs_are_safely_defaulted);
   RUN_TEST(test_buildCsvWifiRow_reports_overflow);
+  RUN_TEST(test_buildCsvWifiRow_rejects_missing_output_buffer);
   return UNITY_END();
 }
-

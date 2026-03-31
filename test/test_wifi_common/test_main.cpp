@@ -20,6 +20,18 @@ static WiFiResult makeValidResult() {
   return r;
 }
 
+static WiFiResult makeValid24gResult() {
+  WiFiResult r = {};
+  strncpy(r.ssid, "TwoFour", sizeof(r.ssid) - 1);
+  const uint8_t bssid[6] = {0x61, 0x52, 0x43, 0x34, 0x25, 0x16};
+  memcpy(r.bssid, bssid, sizeof(r.bssid));
+  r.rssi = -55;
+  r.channel = 11;
+  r.band = WIFI_BAND_24_GHZ;
+  r.capabilities = CAP_ESS | CAP_WPA | CAP_PSK | CAP_TKIP;
+  return r;
+}
+
 static WiFiDedupeHash makeHash(uint8_t seed) {
   WiFiDedupeHash hash = {};
   for (size_t i = 0; i < WIFI_DEDUPE_HASH_SIZE; i++) {
@@ -85,6 +97,10 @@ void test_wifiResult_validation_rules() {
   TEST_ASSERT_TRUE(wifiResultHasTerminatedSsid(valid));
   TEST_ASSERT_TRUE(wifiResultIsValidForDedupe(valid));
 
+  WiFiResult valid_24g = makeValid24gResult();
+  TEST_ASSERT_TRUE(wifiResultHasTerminatedSsid(valid_24g));
+  TEST_ASSERT_TRUE(wifiResultIsValidForDedupe(valid_24g));
+
   WiFiResult bad_band = valid;
   bad_band.band = WIFI_BAND_24_GHZ;
   TEST_ASSERT_FALSE(wifiResultIsValidForDedupe(bad_band));
@@ -92,6 +108,10 @@ void test_wifiResult_validation_rules() {
   WiFiResult zero_bssid = valid;
   memset(zero_bssid.bssid, 0, sizeof(zero_bssid.bssid));
   TEST_ASSERT_FALSE(wifiResultIsValidForDedupe(zero_bssid));
+
+  WiFiResult broadcast_bssid = valid;
+  memset(broadcast_bssid.bssid, 0xFF, sizeof(broadcast_bssid.bssid));
+  TEST_ASSERT_FALSE(wifiResultIsValidForDedupe(broadcast_bssid));
 
   WiFiResult no_null_ssid = valid;
   memset(no_null_ssid.ssid, 'A', sizeof(no_null_ssid.ssid));
@@ -306,6 +326,18 @@ void test_wifiDedupeTable_invalid_inputs() {
   TEST_ASSERT_FALSE(wifiDedupeTableRemember(&invalid, &h));
 }
 
+void test_wifiDedupeTable_zero_hash_uses_reserved_empty_sentinel() {
+  WiFiDedupeHash slots[8] = {};
+  WiFiDedupeHash fifo[4] = {};
+  WiFiDedupeTable table = {};
+  initSmallTable(&table, slots, 8, fifo, 4);
+
+  const WiFiDedupeHash zero = {};
+  TEST_ASSERT_FALSE(wifiDedupeTableContains(&table, &zero));
+  TEST_ASSERT_FALSE(wifiDedupeTableRemember(&table, &zero));
+  TEST_ASSERT_EQUAL_UINT16(0, table.count);
+}
+
 // makeHash(seed) produces bytes {seed, seed+1, seed+2, ...}. On little-endian
 // hosts the first two bytes are read as (seed + (seed+1)*256). For seed values
 // 0, 8, 16, 24 this index is divisible by 8, so all four map to slot 0 in an
@@ -344,6 +376,57 @@ void test_wifiDedupeTable_collision_probe_chain() {
   TEST_ASSERT_EQUAL_UINT16(3, table.count);
 }
 
+void test_wifiDedupeTable_many_insertions_keep_only_most_recent_entries() {
+  WiFiDedupeHash slots[8] = {};
+  WiFiDedupeHash fifo[3] = {};
+  WiFiDedupeTable table = {};
+  initSmallTable(&table, slots, 8, fifo, 3);
+
+  const WiFiDedupeHash h1 = makeHash(1);
+  const WiFiDedupeHash h2 = makeHash(2);
+  const WiFiDedupeHash h3 = makeHash(3);
+  const WiFiDedupeHash h4 = makeHash(4);
+  const WiFiDedupeHash h5 = makeHash(5);
+
+  TEST_ASSERT_TRUE(wifiDedupeTableRemember(&table, &h1));
+  TEST_ASSERT_TRUE(wifiDedupeTableRemember(&table, &h2));
+  TEST_ASSERT_TRUE(wifiDedupeTableRemember(&table, &h3));
+  TEST_ASSERT_TRUE(wifiDedupeTableRemember(&table, &h4));
+  TEST_ASSERT_TRUE(wifiDedupeTableRemember(&table, &h5));
+
+  TEST_ASSERT_EQUAL_UINT16(3, table.count);
+  TEST_ASSERT_FALSE(wifiDedupeTableContains(&table, &h1));
+  TEST_ASSERT_FALSE(wifiDedupeTableContains(&table, &h2));
+  TEST_ASSERT_TRUE(wifiDedupeTableContains(&table, &h3));
+  TEST_ASSERT_TRUE(wifiDedupeTableContains(&table, &h4));
+  TEST_ASSERT_TRUE(wifiDedupeTableContains(&table, &h5));
+}
+
+void test_wifiDedupeTable_evicted_entry_can_be_reinserted() {
+  WiFiDedupeHash slots[8] = {};
+  WiFiDedupeHash fifo[3] = {};
+  WiFiDedupeTable table = {};
+  initSmallTable(&table, slots, 8, fifo, 3);
+
+  const WiFiDedupeHash h1 = makeHash(10);
+  const WiFiDedupeHash h2 = makeHash(11);
+  const WiFiDedupeHash h3 = makeHash(12);
+  const WiFiDedupeHash h4 = makeHash(13);
+
+  TEST_ASSERT_TRUE(wifiDedupeTableRemember(&table, &h1));
+  TEST_ASSERT_TRUE(wifiDedupeTableRemember(&table, &h2));
+  TEST_ASSERT_TRUE(wifiDedupeTableRemember(&table, &h3));
+  TEST_ASSERT_TRUE(wifiDedupeTableRemember(&table, &h4));
+  TEST_ASSERT_FALSE(wifiDedupeTableContains(&table, &h1));
+
+  TEST_ASSERT_TRUE(wifiDedupeTableRemember(&table, &h1));
+  TEST_ASSERT_EQUAL_UINT16(3, table.count);
+  TEST_ASSERT_FALSE(wifiDedupeTableContains(&table, &h2));
+  TEST_ASSERT_TRUE(wifiDedupeTableContains(&table, &h3));
+  TEST_ASSERT_TRUE(wifiDedupeTableContains(&table, &h4));
+  TEST_ASSERT_TRUE(wifiDedupeTableContains(&table, &h1));
+}
+
 int main(int argc, char** argv) {
   (void)argc;
   (void)argv;
@@ -364,6 +447,9 @@ int main(int argc, char** argv) {
   RUN_TEST(test_wifiDedupeTable_fifo_total_desync_resets_table);
   RUN_TEST(test_wifiDedupeTable_reset_clears_state);
   RUN_TEST(test_wifiDedupeTable_invalid_inputs);
+  RUN_TEST(test_wifiDedupeTable_zero_hash_uses_reserved_empty_sentinel);
   RUN_TEST(test_wifiDedupeTable_collision_probe_chain);
+  RUN_TEST(test_wifiDedupeTable_many_insertions_keep_only_most_recent_entries);
+  RUN_TEST(test_wifiDedupeTable_evicted_entry_can_be_reinserted);
   return UNITY_END();
 }
