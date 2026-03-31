@@ -44,7 +44,6 @@ static uint32_t serial_msg_drops = 0;
 static uint32_t dedupe_drops = 0;
 static volatile uint32_t sweep_cycles_completed = 0;
 static volatile uint32_t last_full_sweep_ms = 0;
-static volatile uint32_t wd_core0_last_ms = 0;
 static volatile uint32_t wd_core1_last_ms = 0;
 static uint32_t last_reported_scan_queue_drops = 0;
 static uint32_t last_reported_dedupe_drops = 0;
@@ -358,9 +357,8 @@ void setup() {
   multicore_launch_core1(loop2);
 
 #if CONTROLLER_WATCHDOG_TIMEOUT_MS > 0
-  // Pre-seed both heartbeat timestamps so the first loop() pass always has a
-  // valid baseline regardless of how long core1 takes to start.
-  wd_core0_last_ms = millis();
+  // Pre-seed core1's heartbeat so the first loop() pass always has a valid
+  // baseline regardless of how long core1 takes to start.
   wd_core1_last_ms = millis();
   watchdog_enable(CONTROLLER_WATCHDOG_TIMEOUT_MS, true);
   Serial.println("Watchdog enabled");
@@ -371,9 +369,8 @@ void loop() {
 #if CONTROLLER_WATCHDOG_TIMEOUT_MS > 0
   {
     const uint32_t now = millis();
-    wd_core0_last_ms = now;
     // Only kick if core1 has checked in recently. Core0 being alive is
-    // self-evident since it is running this code.
+    // self-evident since it is running this code and feeding the watchdog.
     if ((now - wd_core1_last_ms) < (CONTROLLER_WATCHDOG_TIMEOUT_MS / 2)) {
       watchdog_update();
     }
