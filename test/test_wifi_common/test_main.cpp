@@ -214,6 +214,68 @@ void test_wifiDedupeTable_corrupt_metadata_guard() {
   TEST_ASSERT_TRUE(wifiDedupeTableContains(&table, &h));
 }
 
+void test_wifiDedupeTable_fifo_desync_skips_stale_entries() {
+  WiFiDedupeHash slots[8] = {};
+  WiFiDedupeHash fifo[3] = {};
+  WiFiDedupeTable table = {};
+  initSmallTable(&table, slots, 8, fifo, 3);
+
+  const WiFiDedupeHash h1 = makeHash(1);
+  const WiFiDedupeHash h2 = makeHash(9);
+  const WiFiDedupeHash h3 = makeHash(17);
+  const WiFiDedupeHash ghost = makeHash(90);
+  const WiFiDedupeHash h4 = makeHash(25);
+
+  TEST_ASSERT_TRUE(wifiDedupeTableRemember(&table, &h1));
+  TEST_ASSERT_TRUE(wifiDedupeTableRemember(&table, &h2));
+  TEST_ASSERT_TRUE(wifiDedupeTableRemember(&table, &h3));
+  TEST_ASSERT_EQUAL_UINT16(3, table.count);
+
+  // Corrupt only the oldest FIFO entry. Insertion should skip the stale hash
+  // and evict the next valid FIFO-backed entry instead of drifting count.
+  table.fifo[table.fifo_head] = ghost;
+
+  TEST_ASSERT_TRUE(wifiDedupeTableRemember(&table, &h4));
+  TEST_ASSERT_EQUAL_UINT16(3, table.count);
+  TEST_ASSERT_TRUE(wifiDedupeTableContains(&table, &h1));
+  TEST_ASSERT_FALSE(wifiDedupeTableContains(&table, &h2));
+  TEST_ASSERT_TRUE(wifiDedupeTableContains(&table, &h3));
+  TEST_ASSERT_TRUE(wifiDedupeTableContains(&table, &h4));
+}
+
+void test_wifiDedupeTable_fifo_total_desync_resets_table() {
+  WiFiDedupeHash slots[8] = {};
+  WiFiDedupeHash fifo[3] = {};
+  WiFiDedupeTable table = {};
+  initSmallTable(&table, slots, 8, fifo, 3);
+
+  const WiFiDedupeHash h1 = makeHash(3);
+  const WiFiDedupeHash h2 = makeHash(11);
+  const WiFiDedupeHash h3 = makeHash(19);
+  const WiFiDedupeHash ghost1 = makeHash(90);
+  const WiFiDedupeHash ghost2 = makeHash(91);
+  const WiFiDedupeHash ghost3 = makeHash(92);
+  const WiFiDedupeHash h4 = makeHash(27);
+
+  TEST_ASSERT_TRUE(wifiDedupeTableRemember(&table, &h1));
+  TEST_ASSERT_TRUE(wifiDedupeTableRemember(&table, &h2));
+  TEST_ASSERT_TRUE(wifiDedupeTableRemember(&table, &h3));
+  TEST_ASSERT_EQUAL_UINT16(3, table.count);
+
+  // If the FIFO no longer points at any live slot, the corruption guard should
+  // reset the table rather than underflow count or leave orphaned entries.
+  table.fifo[0] = ghost1;
+  table.fifo[1] = ghost2;
+  table.fifo[2] = ghost3;
+
+  TEST_ASSERT_TRUE(wifiDedupeTableRemember(&table, &h4));
+  TEST_ASSERT_EQUAL_UINT16(1, table.count);
+  TEST_ASSERT_FALSE(wifiDedupeTableContains(&table, &h1));
+  TEST_ASSERT_FALSE(wifiDedupeTableContains(&table, &h2));
+  TEST_ASSERT_FALSE(wifiDedupeTableContains(&table, &h3));
+  TEST_ASSERT_TRUE(wifiDedupeTableContains(&table, &h4));
+}
+
 void test_wifiDedupeTable_reset_clears_state() {
   WiFiDedupeHash slots[8] = {};
   WiFiDedupeHash fifo[3] = {};
@@ -298,6 +360,8 @@ int main(int argc, char** argv) {
   RUN_TEST(test_wifiDedupeTable_remember_contains_and_duplicate);
   RUN_TEST(test_wifiDedupeTable_ring_overwrite_when_full);
   RUN_TEST(test_wifiDedupeTable_corrupt_metadata_guard);
+  RUN_TEST(test_wifiDedupeTable_fifo_desync_skips_stale_entries);
+  RUN_TEST(test_wifiDedupeTable_fifo_total_desync_resets_table);
   RUN_TEST(test_wifiDedupeTable_reset_clears_state);
   RUN_TEST(test_wifiDedupeTable_invalid_inputs);
   RUN_TEST(test_wifiDedupeTable_collision_probe_chain);

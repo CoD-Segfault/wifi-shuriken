@@ -141,25 +141,40 @@ bool wifiDedupeTableRemember(WiFiDedupeTable* table, const WiFiDedupeHash* hash)
   const uint16_t mask = (uint16_t)(table->table_size - 1u);
 
   if (table->count == table->capacity) {
-    // Evict the oldest entry: retrieve its hash from the FIFO, locate its
-    // current slot via a fresh probe (O(1) expected), then backward-shift delete.
-    const WiFiDedupeHash evict_hash = table->fifo[table->fifo_head];
-    table->fifo_head = (uint16_t)((table->fifo_head + 1u) % table->capacity);
+    bool evicted = false;
+    for (uint16_t attempts = 0; attempts < table->capacity; attempts++) {
+      // Evict the oldest entry: retrieve its hash from the FIFO, locate its
+      // current slot via a fresh probe (O(1) expected), then backward-shift delete.
+      const WiFiDedupeHash evict_hash = table->fifo[table->fifo_head];
+      table->fifo_head = (uint16_t)((table->fifo_head + 1u) % table->capacity);
 
-    uint16_t evict_slot = hashToSlot(&evict_hash, table->table_size);
-    while (!slotIsEmpty(&table->slots[evict_slot])) {
-      if (memcmp(table->slots[evict_slot].bytes,
-                 evict_hash.bytes,
-                 WIFI_DEDUPE_HASH_SIZE) == 0) {
+      if (slotIsEmpty(&evict_hash)) {
+        continue;
+      }
+
+      uint16_t evict_slot = hashToSlot(&evict_hash, table->table_size);
+      while (!slotIsEmpty(&table->slots[evict_slot])) {
+        if (memcmp(table->slots[evict_slot].bytes,
+                   evict_hash.bytes,
+                   WIFI_DEDUPE_HASH_SIZE) == 0) {
+          backwardShiftDelete(table->slots, table->table_size, evict_slot);
+          table->count--;
+          evicted = true;
+          break;
+        }
+        evict_slot = (uint16_t)((evict_slot + 1u) & mask);
+      }
+
+      if (evicted) {
         break;
       }
-      evict_slot = (uint16_t)((evict_slot + 1u) & mask);
     }
-    // Guard against FIFO/table desync: only delete if the slot is occupied.
-    if (!slotIsEmpty(&table->slots[evict_slot])) {
-      backwardShiftDelete(table->slots, table->table_size, evict_slot);
+
+    if (!evicted) {
+      // FIFO metadata no longer references any live table entry. Drop stale
+      // dedupe state so the table can recover to a known-good configuration.
+      wifiDedupeTableReset(table);
     }
-    table->count--;
   }
 
   // Find the first empty slot from the natural position.
