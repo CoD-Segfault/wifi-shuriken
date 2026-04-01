@@ -405,7 +405,6 @@ static void handleCmdScan() {
 }
 
 static void handleCmdResultCount() {
-  update_scan_state();  // Ensure we progress scan completion even if master polls slowly.
   const int8_t c = spi_status;
   write_status_response(c);
   DBG_PRINTF("[SPI] rsp RESULT_COUNT => %d (phase=%u total=%d idx=%d)\n",
@@ -413,8 +412,6 @@ static void handleCmdResultCount() {
 }
 
 static void handleCmdResultGet() {
-  update_scan_state();
-
   if (spi_status == SCANNER_STATUS_BUSY) {
     write_result_packet(RESULT_BUSY);
     DBG_PRINTLN("[SPI] rsp RESULT_GET => BUSY");
@@ -447,7 +444,6 @@ static void handleCmdResultGet() {
 
 static void handleCmdDedupeReset() {
   // Reset is allowed only when not actively scanning/processing.
-  update_scan_state();
   if (scan_phase != ScanPhase::Idle) {
     write_status_response(SCANNER_STATUS_BUSY);
     DBG_PRINTLN("[SPI] rsp DEDUPE_RESET => BUSY");
@@ -551,5 +547,8 @@ void loop() {
   const uint8_t cmd = rx_buf[0];
 
   // Prepare response for the NEXT transaction (pipelined slave semantics).
+  // Keep handlers short here: doing extra scan/Wi-Fi work in this critical path
+  // delays re-queueing the next slave transaction and can make the master miss
+  // the response poll entirely.
   handle_command(cmd);
 }

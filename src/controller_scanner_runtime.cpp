@@ -32,6 +32,9 @@ static constexpr uint8_t SCANNER_RESULT_RESPONSE_PULLS = 8;
 static constexpr uint8_t SCANNER_RESULT_DRAIN_BUDGET = 16;
 // Fast-fail status polling so one missing slot does not stall the round-robin scheduler.
 static constexpr uint8_t SCANNER_RESULT_COUNT_RESPONSE_PULLS = 8;
+// The ESP32 SPI slave needs a short gap after each command transaction to
+// process the just-received frame and queue the response for the next pull.
+static constexpr uint16_t SCANNER_STATUS_FIRST_PULL_US = 250;
 static constexpr uint8_t SCANNER_SCAN_CMD_RETRIES = 1;
 static constexpr uint8_t SCANNER_QUERY_CMD_RETRIES = 2;
 static constexpr uint8_t SCANNER_RESULT_COUNT_CMD_RETRIES = 1;
@@ -251,7 +254,7 @@ static bool scannerCommandWithResponse(const uint8_t* cmd_frame,
                                        uint8_t expected_cmd_tag,
                                        uint8_t* response_frame,
                                        int max_pulls = 8,
-                                       uint32_t first_pull_wait_us = SCANNER_INTERFRAME_US) {
+                                       uint32_t first_pull_wait_us = SCANNER_STATUS_FIRST_PULL_US) {
   // Most commands are acknowledged asynchronously: send once, then keep pulling
   // NOP frames until the scanner echoes the expected command tag.
   uint8_t rx[SCANNER_FRAME_SIZE] = {0};
@@ -437,7 +440,7 @@ static int8_t scannerQueryStatusWithRetry(uint8_t cmd,
                                           int8_t max_valid_status) {
   // SCAN needs a longer first wait than lightweight status commands because
   // the scanner must hand work to the Wi-Fi driver before an ACK is ready.
-  uint32_t first_pull_wait_us = SCANNER_INTERFRAME_US;
+  uint32_t first_pull_wait_us = SCANNER_STATUS_FIRST_PULL_US;
   if (cmd == CMD_SCAN) {
     first_pull_wait_us = SCANNER_SCAN_FIRST_PULL_US;
   }
@@ -472,7 +475,9 @@ static bool scannerGetResult(WiFiResultPacket& pkt) {
 
   for (int attempt = 0; attempt < SCANNER_RESULT_GET_CMD_RETRIES; attempt++) {
     scannerTransferFrame(tx, rx);
-    scannerInterframeWait();
+    if (SCANNER_STATUS_FIRST_PULL_US > 0) {
+      delayMicroseconds(SCANNER_STATUS_FIRST_PULL_US);
+    }
 
     for (int pull = 0; pull < SCANNER_RESULT_RESPONSE_PULLS; pull++) {
       scannerTransferFrame(nop, rx);
