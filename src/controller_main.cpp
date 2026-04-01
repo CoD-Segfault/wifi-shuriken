@@ -418,7 +418,7 @@ void loop() {
     logging.appendCsvRow(q);
     drained++;
   }
-  reportScannerDropCounters();
+  //reportScannerDropCounters();
   // Time-based flush closes the durability gap between row-count flushes.
   logging.flushCsvIfDue();
 
