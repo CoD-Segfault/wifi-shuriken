@@ -30,6 +30,12 @@ bool controllerGnssRuntimeService(TinyGPSPlus& gps,
                                   Adafruit_NeoPixel& pixels,
                                   uint16_t gps_field_max_age_ms);
 
+// Drain incoming NMEA bytes from the Android app on the USB CDC NMEA port,
+// feed a separate TinyGPS++ instance, and return whether the phone-sourced fix
+// is usable. Used as a fallback when the hardware GNSS has no valid fix.
+bool controllerPhoneGnssRuntimeService(TinyGPSPlus& gps_phone,
+                                       uint16_t gps_field_max_age_ms);
+
 // Print the formatted GPS status line through the controller's normalized serial
 // helper so line endings remain consistent with the rest of the console output.
 void controllerGnssRuntimeSerialPrintStatus(TinyGPSPlus& gps,

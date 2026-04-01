@@ -85,11 +85,15 @@ Logger::Logger(SdFat& sd,
                State& state)
     : sd_(sd),
       log_file_(log_file),
-      gps_(gps),
+      gps_ptr_(&gps),
       gnss_uart_(gnss_uart),
       serial_(serial),
       config_(config),
       state_(state) {}
+
+void Logger::setGpsSource(TinyGPSPlus* gps) {
+  gps_ptr_ = gps;
+}
 
 void Logger::initUtcTimezone() {
   static bool tz_initialized = false;
@@ -117,15 +121,15 @@ void Logger::sdDateTimeCallbackThunk(uint16_t* date, uint16_t* time) {
 }
 
 bool Logger::gnssDateTimeValid() const {
-  return gps_.date.isValid() &&
-         gps_.time.isValid() &&
-         gps_.date.year() >= config_.gnss_min_valid_year &&
-         gps_.date.year() < GNSS_INVALID_RTC_YEAR_FLOOR &&
-         gps_.date.month() >= 1 && gps_.date.month() <= 12 &&
-         gps_.date.day() >= 1 && gps_.date.day() <= 31 &&
-         gps_.time.hour() <= 23 &&
-         gps_.time.minute() <= 59 &&
-         gps_.time.second() <= 59;
+  return gps_ptr_->date.isValid() &&
+         gps_ptr_->time.isValid() &&
+         gps_ptr_->date.year() >= config_.gnss_min_valid_year &&
+         gps_ptr_->date.year() < GNSS_INVALID_RTC_YEAR_FLOOR &&
+         gps_ptr_->date.month() >= 1 && gps_ptr_->date.month() <= 12 &&
+         gps_ptr_->date.day() >= 1 && gps_ptr_->date.day() <= 31 &&
+         gps_ptr_->time.hour() <= 23 &&
+         gps_ptr_->time.minute() <= 59 &&
+         gps_ptr_->time.second() <= 59;
 }
 
 bool Logger::gnssDateTimeToTmUtc(struct tm& tm_out) const {
@@ -134,12 +138,12 @@ bool Logger::gnssDateTimeToTmUtc(struct tm& tm_out) const {
   }
 
   tm_out = {};
-  tm_out.tm_year = (int)gps_.date.year() - 1900;
-  tm_out.tm_mon = (int)gps_.date.month() - 1;
-  tm_out.tm_mday = (int)gps_.date.day();
-  tm_out.tm_hour = (int)gps_.time.hour();
-  tm_out.tm_min = (int)gps_.time.minute();
-  tm_out.tm_sec = (int)gps_.time.second();
+  tm_out.tm_year = (int)gps_ptr_->date.year() - 1900;
+  tm_out.tm_mon = (int)gps_ptr_->date.month() - 1;
+  tm_out.tm_mday = (int)gps_ptr_->date.day();
+  tm_out.tm_hour = (int)gps_ptr_->time.hour();
+  tm_out.tm_min = (int)gps_ptr_->time.minute();
+  tm_out.tm_sec = (int)gps_ptr_->time.second();
   tm_out.tm_isdst = 0;
   return true;
 }
@@ -162,8 +166,8 @@ void Logger::syncMasterClockFromGnss() {
   if (!gnssDateTimeValid()) {
     return;
   }
-  if (gps_.date.age() >= config_.gps_field_max_age_ms ||
-      gps_.time.age() >= config_.gps_field_max_age_ms) {
+  if (gps_ptr_->date.age() >= config_.gps_field_max_age_ms ||
+      gps_ptr_->time.age() >= config_.gps_field_max_age_ms) {
     return;
   }
 
@@ -301,7 +305,7 @@ void Logger::captureBootTimestampFromGnss() {
     while ((millis() - read_start) < per_read_timeout_ms) {
       while (gnss_uart_.available()) {
         const char c = static_cast<char>(gnss_uart_.read());
-        gps_.encode(c);
+        gps_ptr_->encode(c);
         if (c == '\n') {
           line_complete = true;
           break;
@@ -509,24 +513,24 @@ void Logger::appendCsvRow(const QueuedScanResult& r) {
   formatGpsTimestamp(ts, sizeof(ts));
 
   const bool have_location =
-      gps_.location.isValid() &&
-      gps_.location.age() < config_.gps_field_max_age_ms;
+      gps_ptr_->location.isValid() &&
+      gps_ptr_->location.age() < config_.gps_field_max_age_ms;
   const bool have_altitude =
-      gps_.altitude.isValid() &&
-      gps_.altitude.age() < config_.gps_field_max_age_ms;
+      gps_ptr_->altitude.isValid() &&
+      gps_ptr_->altitude.age() < config_.gps_field_max_age_ms;
   const bool have_accuracy =
-      gps_.hdop.isValid() &&
-      gps_.hdop.age() < config_.gps_field_max_age_ms;
+      gps_ptr_->hdop.isValid() &&
+      gps_ptr_->hdop.age() < config_.gps_field_max_age_ms;
 
   if (have_location) {
-    snprintf(lat_csv, sizeof(lat_csv), "%.7f", gps_.location.lat());
-    snprintf(lon_csv, sizeof(lon_csv), "%.7f", gps_.location.lng());
+    snprintf(lat_csv, sizeof(lat_csv), "%.7f", gps_ptr_->location.lat());
+    snprintf(lon_csv, sizeof(lon_csv), "%.7f", gps_ptr_->location.lng());
   }
   if (have_altitude) {
-    snprintf(alt_csv, sizeof(alt_csv), "%.2f", gps_.altitude.meters());
+    snprintf(alt_csv, sizeof(alt_csv), "%.2f", gps_ptr_->altitude.meters());
   }
   if (have_accuracy) {
-    snprintf(acc_csv, sizeof(acc_csv), "%.2f", gps_.hdop.hdop() * 5.0);
+    snprintf(acc_csv, sizeof(acc_csv), "%.2f", gps_ptr_->hdop.hdop() * 5.0);
   }
   if (!have_location) {
     state_.csv_rows_blank_gps++;

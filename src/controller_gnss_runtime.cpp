@@ -138,6 +138,23 @@ bool controllerGnssRuntimeService(TinyGPSPlus& gps,
   return usable_fix;
 }
 
+bool controllerPhoneGnssRuntimeService(TinyGPSPlus& gps_phone,
+                                       uint16_t gps_field_max_age_ms) {
+#if defined(USE_TINYUSB)
+  // Drain NMEA sentences arriving from the Android app on the shared NMEA CDC
+  // port. The app sends standard NMEA (GPRMC/GPGGA) which TinyGPS++ parses
+  // the same way it does hardware output.
+  while (nmea_passthrough_cdc.available()) {
+    gps_phone.encode(static_cast<char>(nmea_passthrough_cdc.read()));
+  }
+#endif
+
+  // Accept the phone fix if location is present and fresh. Satellite count is
+  // not required since some apps omit GGA and only send RMC.
+  return gps_phone.location.isValid() &&
+         gps_phone.location.age() < gps_field_max_age_ms;
+}
+
 void controllerGnssRuntimeSerialPrintStatus(TinyGPSPlus& gps,
                                             bool usable_fix,
                                             ControllerSerialPrintfFn serial_printf_normalized) {

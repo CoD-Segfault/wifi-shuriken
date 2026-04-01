@@ -29,6 +29,7 @@ SdFat sd;
 FsFile logFile;
 Adafruit_NeoPixel pixels(NUMPIXELS, RGB_PIN, NEO_GRB + NEO_KHZ800);
 TinyGPSPlus gps;
+TinyGPSPlus gps_phone;
 using QueuedScanResult = pico_logging::QueuedScanResult;
 
 // Cross-core queues:
@@ -178,10 +179,11 @@ static void reportScannerDropCounters() {
   }
 }
 
-static void printPeriodicStatus(bool usable_fix) {
+static void printPeriodicStatus(bool usable_fix, bool usable_phone_fix) {
   static uint32_t lastStatMs = 0;
 #if PERIODIC_STATUS_INTERVAL_MS == 0
   (void)usable_fix;
+  (void)usable_phone_fix;
   return;
 #else
   const uint32_t now = millis();
@@ -191,6 +193,13 @@ static void printPeriodicStatus(bool usable_fix) {
   lastStatMs = now;
   serialPrintRuntimeStatus();
   controllerGnssRuntimeSerialPrintStatus(gps, usable_fix, serialPrintfNormalized);
+  serialPrintfNormalized("GPS(phone): usable=%s loc_valid=%s lat=%.7f lon=%.7f age=%lu chars=%lu\n",
+                         usable_phone_fix ? "YES" : "NO",
+                         gps_phone.location.isValid() ? "YES" : "NO",
+                         gps_phone.location.isValid() ? gps_phone.location.lat() : 0.0,
+                         gps_phone.location.isValid() ? gps_phone.location.lng() : 0.0,
+                         (unsigned long)gps_phone.location.age(),
+                         (unsigned long)gps_phone.charsProcessed());
 #endif
 }
 
@@ -380,7 +389,14 @@ void loop() {
 
   // Read GNSS data, update the fix LED, and compute the current "usable fix"
   // state that drives logging and periodic status.
-  const bool usable_fix = controllerGnssRuntimeService(gps, pixels, CONTROLLER_GPS_FIELD_MAX_AGE_MS);
+  const bool usable_hw_fix = controllerGnssRuntimeService(gps, pixels, CONTROLLER_GPS_FIELD_MAX_AGE_MS);
+  const bool usable_phone_fix = controllerPhoneGnssRuntimeService(gps_phone, CONTROLLER_GPS_FIELD_MAX_AGE_MS);
+  const bool usable_fix = usable_hw_fix || usable_phone_fix;
+
+  // Point the logger at whichever source has a valid fix. Hardware GPS takes
+  // priority; phone GPS is the fallback when the module has no lock.
+  logging.setGpsSource(usable_hw_fix ? &gps : &gps_phone);
+
   maybeRequestDedupeResetOnFixAcquire(usable_fix);
   logging.syncMasterClockFromGnss();
 
@@ -410,5 +426,5 @@ void loop() {
     logging.tryRecoverSdLogging();
   }
 
-  printPeriodicStatus(usable_fix);
+  printPeriodicStatus(usable_hw_fix, usable_phone_fix);
 }

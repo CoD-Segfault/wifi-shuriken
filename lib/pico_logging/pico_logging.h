@@ -59,6 +59,11 @@ class Logger {
          const Config& config,
          State& state);
 
+  // Switch the GPS source used for location fields in CSV rows and clock sync.
+  // Pass &gps (hardware) normally; pass &gps_phone when falling back to the
+  // phone-sourced fix. Must not be called with nullptr.
+  void setGpsSource(TinyGPSPlus* gps);
+
   void initUtcTimezone();
   void registerSdDateTimeCallback();
 
@@ -91,7 +96,7 @@ class Logger {
 
   SdFat& sd_;
   FsFile& log_file_;
-  TinyGPSPlus& gps_;
+  TinyGPSPlus* gps_ptr_;
   HardwareSerial& gnss_uart_;
   Stream& serial_;
   const Config& config_;
