@@ -19,6 +19,7 @@
 #include "Configuration.h"
 #include "controller_gnss_runtime.h"
 #include "controller_scanner_runtime.h"
+#include "controller_status.h"
 
 // Top-level controller orchestration lives here after the runtime split.
 // This file owns Arduino entrypoints, shared peripherals, cross-core queues,
@@ -389,7 +390,7 @@ void loop() {
 
   // Read GNSS data, update the fix LED, and compute the current "usable fix"
   // state that drives logging and periodic status.
-  const bool usable_hw_fix = controllerGnssRuntimeService(gps, pixels, CONTROLLER_GPS_FIELD_MAX_AGE_MS);
+  const bool usable_hw_fix = controllerGnssRuntimeService(gps, CONTROLLER_GPS_FIELD_MAX_AGE_MS);
   const bool usable_phone_fix = controllerPhoneGnssRuntimeService(gps_phone, CONTROLLER_GPS_FIELD_MAX_AGE_MS);
   const bool usable_fix = usable_hw_fix || usable_phone_fix;
 
@@ -425,6 +426,9 @@ void loop() {
   if (!logging_state.csv_ready) {
     logging.tryRecoverSdLogging();
   }
+
+  controllerStatusUpdateLed(pixels, controllerStatusCompute(
+      logging_state.sd_ready, usable_fix, logging_state.csv_ready));
 
   printPeriodicStatus(usable_hw_fix, usable_phone_fix);
 }

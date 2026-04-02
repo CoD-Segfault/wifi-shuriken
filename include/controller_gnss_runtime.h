@@ -2,7 +2,6 @@
 
 #include <stdint.h>
 
-class Adafruit_NeoPixel;
 class TinyGPSPlus;
 
 // Shared GNSS timing thresholds used both by the GNSS runtime and the
@@ -24,10 +23,9 @@ void controllerGnssRuntimeInitUart();
 // Send a PMTK command and emit the same console logging used before extraction.
 void controllerGnssRuntimeSendPMTKCommand(const char* cmd);
 
-// Drain GNSS UART bytes, feed TinyGPS++, mirror raw NMEA if enabled, and update
-// the GPS status LED. Returns whether the current fix is considered usable.
+// Drain GNSS UART bytes, feed TinyGPS++, and mirror raw NMEA if enabled.
+// Returns whether the current fix is considered usable.
 bool controllerGnssRuntimeService(TinyGPSPlus& gps,
-                                  Adafruit_NeoPixel& pixels,
                                   uint16_t gps_field_max_age_ms);
 
 // Drain incoming NMEA bytes from the Android app on the USB CDC NMEA port,

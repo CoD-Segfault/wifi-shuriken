@@ -50,18 +50,6 @@ static inline void nmeaPassthroughWriteChar(char c) {
 #endif
 }
 
-static void updateGpsFixLed(Adafruit_NeoPixel& pixels, bool usable_fix) {
-  static int8_t last_state = -1;
-  const int8_t state = usable_fix ? 1 : 0;
-  if (state == last_state) {
-    return;
-  }
-  last_state = state;
-
-  const uint32_t color = usable_fix ? pixels.Color(0, 96, 0) : pixels.Color(75, 20, 0);
-  pixels.setPixelColor(0, color);
-  pixels.show();
-}
 
 void controllerGnssRuntimeSendPMTKCommand(const char* cmd) {
   GNSS_UART.println(cmd);
@@ -114,7 +102,6 @@ void controllerGnssRuntimeInitUart() {
 }
 
 bool controllerGnssRuntimeService(TinyGPSPlus& gps,
-                                  Adafruit_NeoPixel& pixels,
                                   uint16_t gps_field_max_age_ms) {
   // Keep the GNSS UART drained aggressively so TinyGPS++ parsing and optional
   // NMEA mirroring do not fall behind while core0 is also handling SD writes.
@@ -134,7 +121,6 @@ bool controllerGnssRuntimeService(TinyGPSPlus& gps,
       gps.location.age() < gps_field_max_age_ms &&
       gps.satellites.isValid() &&
       gps.satellites.value() >= 3;
-  updateGpsFixLed(pixels, usable_fix);
   return usable_fix;
 }
 
