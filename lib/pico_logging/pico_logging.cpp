@@ -27,6 +27,7 @@ namespace {
 // Some GNSS modules emit 2080+ placeholder dates before RTC/fix is valid.
 static constexpr uint16_t GNSS_INVALID_RTC_YEAR_FLOOR = 2080;
 static constexpr size_t PICO_UID_HEX_BYTES = 8;
+static constexpr char RESET_LOG_PATH[] = "/RESETLOG.CSV";
 
 void appendUidToValue(const char* base, const char* suffix, char* out, size_t out_len) {
   if (!out || out_len == 0) {
@@ -98,17 +99,31 @@ void Logger::setGpsSource(TinyGPSPlus* gps) {
 void Logger::initUtcTimezone() {
   static bool tz_initialized = false;
   if (tz_initialized) {
+    recoverMasterClockFromSystem();
     return;
   }
 
   setenv("TZ", "UTC0", 1);
   tzset();
   tz_initialized = true;
+  recoverMasterClockFromSystem();
 }
 
 void Logger::registerSdDateTimeCallback() {
   date_time_callback_instance_ = this;
   SdFile::dateTimeCallback(sdDateTimeCallbackThunk);
+}
+
+void Logger::setBootResetReason(uint8_t reason_code, const char* reason_text) {
+  state_.boot_reset_reason_code = reason_code;
+  state_.boot_reset_log_pending = true;
+  state_.boot_reset_log_appended = false;
+
+  const char* text = (reason_text != nullptr && reason_text[0] != '\0')
+                         ? reason_text
+                         : "UNKNOWN";
+  strncpy(state_.boot_reset_reason, text, sizeof(state_.boot_reset_reason) - 1);
+  state_.boot_reset_reason[sizeof(state_.boot_reset_reason) - 1] = '\0';
 }
 
 void Logger::sdDateTimeCallbackThunk(uint16_t* date, uint16_t* time) {
@@ -145,6 +160,45 @@ bool Logger::gnssDateTimeToTmUtc(struct tm& tm_out) const {
   tm_out.tm_min = (int)gps_ptr_->time.minute();
   tm_out.tm_sec = (int)gps_ptr_->time.second();
   tm_out.tm_isdst = 0;
+  return true;
+}
+
+bool Logger::systemClockEpochLooksPlausible(time_t epoch) const {
+  if (epoch <= 0) {
+    return false;
+  }
+
+  struct tm tm_utc = {};
+  if (gmtime_r(&epoch, &tm_utc) == nullptr) {
+    return false;
+  }
+
+  const uint16_t year = (uint16_t)(tm_utc.tm_year + 1900);
+  return year >= config_.gnss_min_valid_year &&
+         year < GNSS_INVALID_RTC_YEAR_FLOOR;
+}
+
+bool Logger::recoverMasterClockFromSystem() {
+  if (state_.master_clock_valid) {
+    return true;
+  }
+
+  time_t now = 0;
+  time(&now);
+  if (!systemClockEpochLooksPlausible(now)) {
+    return false;
+  }
+
+  state_.master_clock_valid = true;
+
+  char stamp[24] = {};
+  struct tm tm_utc = {};
+  if (gmtime_r(&now, &tm_utc) != nullptr &&
+      strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &tm_utc) > 0) {
+    serial_.print("Recovered persisted master clock: ");
+    serial_.print(stamp);
+    serial_.println(" UTC");
+  }
   return true;
 }
 
@@ -205,6 +259,8 @@ bool Logger::ensureBootTimestampFromClock() {
     return true;
   }
 
+  recoverMasterClockFromSystem();
+
   uint32_t epoch = 0;
   if (!masterClockNowEpochSeconds(epoch)) {
     return false;
@@ -232,6 +288,8 @@ void Logger::sdDateTimeCallback(uint16_t* date, uint16_t* time) {
   uint8_t h = 0;
   uint8_t min = 0;
   uint8_t s = 0;
+
+  recoverMasterClockFromSystem();
 
   uint32_t epoch = 0;
   if (masterClockNowEpochSeconds(epoch)) {
@@ -287,6 +345,57 @@ void Logger::formatGpsTimestamp(char* out, size_t out_len) const {
   if (strftime(out, out_len, "%Y-%m-%d %H:%M:%S", &tm_utc) == 0) {
     out[0] = '\0';
   }
+}
+
+void Logger::tryAppendBootResetLog() {
+  if (!state_.boot_reset_log_pending ||
+      state_.boot_reset_log_appended ||
+      !state_.sd_ready) {
+    return;
+  }
+
+  recoverMasterClockFromSystem();
+
+  char timestamp[24] = {};
+  formatGpsTimestamp(timestamp, sizeof(timestamp));
+  if (timestamp[0] == '\0') {
+    return;
+  }
+
+  const bool exists = sd_.exists(RESET_LOG_PATH);
+  FsFile reset_log = sd_.open(RESET_LOG_PATH, O_RDWR | O_CREAT | O_APPEND);
+  if (!reset_log) {
+    serial_.println("Reset log open failed; will retry");
+    return;
+  }
+
+  if (!exists || reset_log.size() == 0) {
+    reset_log.println("TimestampUTC,ResetReason,ResetCode,AppVersion");
+  }
+
+  char row[128] = {};
+  (void)snprintf(row,
+                 sizeof(row),
+                 "%s,%s,%u,%s",
+                 timestamp,
+                 state_.boot_reset_reason[0] != '\0' ? state_.boot_reset_reason : "UNKNOWN",
+                 (unsigned)state_.boot_reset_reason_code,
+                 APP_RELEASE_VERSION);
+  reset_log.println(row);
+  reset_log.flush();
+
+  if (reset_log.getWriteError()) {
+    serial_.println("Reset log write failed; will retry");
+    reset_log.close();
+    return;
+  }
+
+  reset_log.close();
+  state_.boot_reset_log_appended = true;
+  state_.boot_reset_log_pending = false;
+
+  serial_.print("Reset log appended: ");
+  serial_.println(row);
 }
 
 void Logger::captureBootTimestampFromGnss() {

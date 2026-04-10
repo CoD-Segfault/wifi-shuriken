@@ -40,11 +40,15 @@ struct State {
   bool csv_dirty = false;
   bool csv_path_selected = false;
   bool master_clock_valid = false;
+  bool boot_reset_log_pending = false;
+  bool boot_reset_log_appended = false;
   uint32_t sd_next_retry_ms = 0;
   size_t sd_retry_clock_index = 0;
   uint32_t csv_last_flush_ms = 0;
   uint32_t csv_rows = 0;
   uint32_t csv_rows_blank_gps = 0;
+  uint8_t boot_reset_reason_code = 0;
+  char boot_reset_reason[24] = "";
   char csv_boot_timestamp[15] = "";
   char csv_log_path[40] = "";
 };
@@ -66,6 +70,8 @@ class Logger {
 
   void initUtcTimezone();
   void registerSdDateTimeCallback();
+  void setBootResetReason(uint8_t reason_code, const char* reason_text);
+  void tryAppendBootResetLog();
 
   void syncMasterClockFromGnss();
   bool ensureBootTimestampFromClock();
@@ -88,6 +94,8 @@ class Logger {
 
   bool gnssDateTimeValid() const;
   bool gnssDateTimeToTmUtc(struct tm& tm_out) const;
+  bool systemClockEpochLooksPlausible(time_t epoch) const;
+  bool recoverMasterClockFromSystem();
   bool masterClockNowEpochSeconds(uint32_t& epoch_out) const;
   void formatGpsTimestamp(char* out, size_t out_len) const;
 
@@ -104,6 +112,5 @@ class Logger {
 };
 
 }  // namespace pico_logging
-
 
 

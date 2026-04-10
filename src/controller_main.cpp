@@ -83,6 +83,21 @@ static const pico_logging::Config logging_config = {
 };
 static pico_logging::Logger logging(sd, logFile, gps, GNSS_UART, Serial, logging_config, logging_state);
 
+static const char* controllerResetReasonToString(RP2040::resetReason_t reason) {
+  switch (reason) {
+    case RP2040::PWRON_RESET: return "PWRON";
+    case RP2040::RUN_PIN_RESET: return "RUN_PIN";
+    case RP2040::SOFT_RESET: return "SOFT";
+    case RP2040::WDT_RESET: return "WATCHDOG";
+    case RP2040::DEBUG_RESET: return "DEBUG";
+    case RP2040::GLITCH_RESET: return "GLITCH";
+    case RP2040::BROWNOUT_RESET: return "BROWNOUT";
+    case RP2040::UNKNOWN_RESET:
+    default:
+      return "UNKNOWN";
+  }
+}
+
 // Normalize outgoing console text to CRLF so host tools on Linux and Windows
 // render the controller console consistently.
 static void streamWriteNormalized(Stream& stream, const char* text) {
@@ -280,6 +295,13 @@ void setup() {
   serialPrintfNormalized("RGB config: data=%d power_en=%d power_pin=%d\n",
                          RGB_PIN, RGB_POWER_ENABLED, RGB_POWER_PIN);
   logging.initUtcTimezone();
+  const RP2040::resetReason_t boot_reset_reason = rp2040.getResetReason();
+  const char* const boot_reset_reason_text =
+      controllerResetReasonToString(boot_reset_reason);
+  logging.setBootResetReason((uint8_t)boot_reset_reason, boot_reset_reason_text);
+  serialPrintfNormalized("Boot reset reason: %u (%s)\n",
+                         (unsigned)boot_reset_reason,
+                         boot_reset_reason_text);
 #if defined(USE_TINYUSB)
   serialPrintfNormalized("USB CDC IDs: CDC0='%s' CDC1='%s'\n",
                          USB_CDC0_IFACE_NAME, USB_CDC1_IFACE_NAME);
@@ -309,6 +331,7 @@ void setup() {
     logging_state.sd_next_retry_ms = millis() + SD_RETRY_BACKGROUND_MS;
   } else {
     Serial.println("SD initialization done");
+    logging.tryAppendBootResetLog();
   }
   // Queue capacities are sized to tolerate short bursts from core1 while core0
   // is busy with SD or GNSS work.
@@ -361,6 +384,7 @@ void setup() {
         logging_state.sd_next_retry_ms = millis() + SD_RETRY_BACKGROUND_MS;
       }
     }
+    logging.tryAppendBootResetLog();
   }
 
   // Set up second core loop for SPI communication with scanner
@@ -426,6 +450,7 @@ void loop() {
   if (!logging_state.csv_ready) {
     logging.tryRecoverSdLogging();
   }
+  logging.tryAppendBootResetLog();
 
   controllerStatusUpdateLed(pixels, controllerStatusCompute(
       logging_state.sd_ready, usable_fix, logging_state.csv_ready));
