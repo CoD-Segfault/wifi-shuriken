@@ -444,10 +444,10 @@ bool Logger::selectCsvLogPath() {
   for (uint16_t suffix = 0; suffix < 100; suffix++) {
     if (suffix == 0) {
       snprintf(state_.csv_log_path, sizeof(state_.csv_log_path),
-               "/CSVLOG_%s.CSV", state_.csv_boot_timestamp);
+               "/shuriken_%s.csv", state_.csv_boot_timestamp);
     } else {
       snprintf(state_.csv_log_path, sizeof(state_.csv_log_path),
-               "/CSVLOG_%s_%02u.CSV", state_.csv_boot_timestamp, suffix);
+               "/shuriken_%s_%02u.csv", state_.csv_boot_timestamp, suffix);
     }
     if (!sd_.exists(state_.csv_log_path)) {
       state_.csv_path_selected = true;
