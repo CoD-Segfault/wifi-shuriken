@@ -20,6 +20,7 @@
 #include "controller_gnss_runtime.h"
 #include "controller_scanner_runtime.h"
 #include "controller_status.h"
+#include "controller_update_runtime.h"
 
 // Top-level controller orchestration lives here after the runtime split.
 // This file owns Arduino entrypoints, shared peripherals, cross-core queues,
@@ -331,6 +332,11 @@ void setup() {
     logging_state.sd_next_retry_ms = millis() + SD_RETRY_BACKGROUND_MS;
   } else {
     Serial.println("SD initialization done");
+  }
+  if (controllerUpdateRuntimeHandleBoot(sd, logging_state.sd_ready, Serial, pixels)) {
+    return;
+  }
+  if (logging_state.sd_ready) {
     logging.tryAppendBootResetLog();
   }
   // Queue capacities are sized to tolerate short bursts from core1 while core0

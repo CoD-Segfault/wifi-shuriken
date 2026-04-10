@@ -2,7 +2,7 @@
 
 // Firmware version used in CSV metadata fields.
 #ifndef APP_VERSION
-#define APP_VERSION "0.1"
+#define APP_VERSION "0.2"
 #endif
 #ifndef APP_RELEASE_VERSION
 #define APP_RELEASE_VERSION APP_VERSION
@@ -165,6 +165,22 @@
 // and reboots the controller. Set to 0 to disable the watchdog entirely.
 #ifndef CONTROLLER_WATCHDOG_TIMEOUT_MS
 #define CONTROLLER_WATCHDOG_TIMEOUT_MS 8000
+#endif
+
+// SD-card firmware update settings for RP2350 controller builds. The incoming
+// image is staged from SD into internal LittleFS, then the OTA bootloader
+// applies it on reboot.
+#ifndef CONTROLLER_SD_UPDATE_ENABLED
+#define CONTROLLER_SD_UPDATE_ENABLED 1
+#endif
+#ifndef CONTROLLER_SD_UPDATE_PATH
+#define CONTROLLER_SD_UPDATE_PATH "/controller.bin"
+#endif
+#ifndef CONTROLLER_SD_UPDATE_APPLIED_PATH
+#define CONTROLLER_SD_UPDATE_APPLIED_PATH "/controller.applied.bin"
+#endif
+#ifndef CONTROLLER_SD_UPDATE_CHUNK_BYTES
+#define CONTROLLER_SD_UPDATE_CHUNK_BYTES 1024
 #endif
 
 // Periodic runtime/GPS status print interval in milliseconds.
