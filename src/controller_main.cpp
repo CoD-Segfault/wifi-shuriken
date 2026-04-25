@@ -352,7 +352,8 @@ void setup() {
   controllerScannerRuntimeInitBus();
   controllerScannerRuntimeHandleScannerUpdatesFromSd(sd,
                                                      logging_state.sd_ready,
-                                                     Serial);
+                                                     Serial,
+                                                     pixels);
 
 #if SCANNER_USE_SHIFTREG_CS
   serialPrintfNormalized("SPI1 initialized (shift-register scanner CS enabled, slots=%u).\n",

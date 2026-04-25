@@ -1,6 +1,7 @@
 #include "controller_scanner_runtime.h"
 
 #include <Arduino.h>
+#include <Adafruit_NeoPixel.h>
 #include <SPI.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -50,6 +51,8 @@ static constexpr uint16_t SCANNER_OTA_INTERFRAME_US = SCANNER_SPI_UPDATE_INTERFR
 static constexpr uint32_t SCANNER_OTA_PROGRESS_BYTES = 32768;
 static constexpr uint16_t SCANNER_OTA_POST_SLOT_DELAY_MS = 250;
 static constexpr uint16_t SCANNER_OTA_FLASH_SECTOR_BYTES = SCANNER_SPI_UPDATE_FLASH_SECTOR_BYTES;
+static constexpr uint8_t SCANNER_UPDATE_LED_RED = 80;
+static constexpr uint8_t SCANNER_UPDATE_LED_BLUE = 80;
 // Scanner transport hardware config (mapped from legacy config macro names).
 static constexpr int SCANNER_PIN_SCK = ESP_PIN_SCK;
 static constexpr int SCANNER_PIN_MOSI = ESP_PIN_MOSI;
@@ -387,6 +390,13 @@ static const char* scannerOtaStatusToString(int8_t status) {
     case OTA_STATUS_END_FAILED: return "END_FAILED";
     default: return "UNKNOWN";
   }
+}
+
+static void showScannerUpdateLed(Adafruit_NeoPixel& pixels) {
+  pixels.setPixelColor(0, pixels.Color(SCANNER_UPDATE_LED_RED,
+                                       0,
+                                       SCANNER_UPDATE_LED_BLUE));
+  pixels.show();
 }
 
 static bool scannerOtaCommandWithAck(const uint8_t* cmd_frame,
@@ -812,11 +822,13 @@ static bool buildScannerAppliedPath(SdFat& sd, char* out, size_t out_len) {
 
 bool controllerScannerRuntimeHandleScannerUpdatesFromSd(SdFat& sd,
                                                         bool sd_ready,
-                                                        Stream& serial) {
+                                                        Stream& serial,
+                                                        Adafruit_NeoPixel& pixels) {
 #if !SCANNER_SPI_UPDATE_ENABLED
   (void)sd;
   (void)sd_ready;
   (void)serial;
+  (void)pixels;
   return false;
 #else
   if (!sd_ready || !sd.exists(SCANNER_SPI_UPDATE_PATH)) {
@@ -842,6 +854,8 @@ bool controllerScannerRuntimeHandleScannerUpdatesFromSd(SdFat& sd,
     return false;
   }
   source.close();
+
+  showScannerUpdateLed(pixels);
 
   serial.print("Scanner SPI OTA image: ");
   serial.print(image_size);

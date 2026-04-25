@@ -4,6 +4,8 @@
 #include <SdFat.h>
 #include <stdint.h>
 
+class Adafruit_NeoPixel;
+
 #include "pico/util/queue.h"
 #include "wifi_dedupe.h"
 
@@ -38,7 +40,8 @@ void controllerScannerRuntimeRequestDedupeReset();
 // window before controllerScannerRuntimeRun() starts normal scan scheduling.
 bool controllerScannerRuntimeHandleScannerUpdatesFromSd(SdFat& sd,
                                                         bool sd_ready,
-                                                        Stream& serial);
+                                                        Stream& serial,
+                                                        Adafruit_NeoPixel& pixels);
 
 // Run the scanner service loop on core1 forever.
 void controllerScannerRuntimeRun(const ControllerScannerRuntimeContext& context);
