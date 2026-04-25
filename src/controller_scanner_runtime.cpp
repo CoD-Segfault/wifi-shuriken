@@ -35,13 +35,13 @@ static constexpr uint8_t SCANNER_RESULT_DRAIN_BUDGET = 16;
 static constexpr uint8_t SCANNER_RESULT_COUNT_RESPONSE_PULLS = 8;
 // The ESP32 SPI slave needs a short gap after each command transaction to
 // process the just-received frame and queue the response for the next pull.
-static constexpr uint16_t SCANNER_STATUS_FIRST_PULL_US = 250;
+static constexpr uint16_t SCANNER_STATUS_FIRST_PULL_US = SCANNER_STATUS_FIRST_PULL_DELAY_US;
 static constexpr uint8_t SCANNER_SCAN_CMD_RETRIES = 2;
 static constexpr uint8_t SCANNER_QUERY_CMD_RETRIES = 2;
 static constexpr uint8_t SCANNER_RESULT_COUNT_CMD_RETRIES = 2;
 static constexpr uint8_t SCANNER_RESULT_GET_CMD_RETRIES = 2;
 // Keep a short guard gap after CMD_SCAN before the first response pull.
-static constexpr uint16_t SCANNER_SCAN_FIRST_PULL_US = 3000;
+static constexpr uint16_t SCANNER_SCAN_FIRST_PULL_US = SCANNER_SCAN_FIRST_PULL_DELAY_US;
 static constexpr uint8_t SCANNER_SCAN_BUSY_CONFIRM_POLLS = 2;
 static constexpr uint16_t SCANNER_SCAN_BUSY_CONFIRM_DELAY_US = 2500;
 static constexpr uint32_t SCANNER_OTA_SPI_HZ = SCANNER_SPI_UPDATE_CLOCK;

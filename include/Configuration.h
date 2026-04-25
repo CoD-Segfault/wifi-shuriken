@@ -208,7 +208,7 @@
 #define SCANNER_SPI_UPDATE_INTERFRAME_US 25
 #endif
 #ifndef SCANNER_SPI_UPDATE_FIRST_PULL_US
-#define SCANNER_SPI_UPDATE_FIRST_PULL_US 100
+#define SCANNER_SPI_UPDATE_FIRST_PULL_US 500
 #endif
 #ifndef SCANNER_SPI_UPDATE_RESPONSE_PULLS
 #define SCANNER_SPI_UPDATE_RESPONSE_PULLS 500
@@ -259,6 +259,18 @@
 // SPI delay between command and follow-up polling frame in microseconds.
 #ifndef ESP_INTERFRAME_US
 #define ESP_INTERFRAME_US 10  // Delay between SPI command and response pulls.
+#endif
+
+// Delay after lightweight scanner commands before the controller starts pulling
+// the response frame. Keep low so result/status polling stays snappy.
+#ifndef SCANNER_STATUS_FIRST_PULL_DELAY_US
+#define SCANNER_STATUS_FIRST_PULL_DELAY_US 250
+#endif
+
+// Delay after CMD_SCAN before the first response pull. Starting a Wi-Fi scan can
+// take longer on downclocked ESP32-C5 scanners before the ACK frame is queued.
+#ifndef SCANNER_SCAN_FIRST_PULL_DELAY_US
+#define SCANNER_SCAN_FIRST_PULL_DELAY_US 5000
 #endif
 
 #if defined(USE_TINYUSB)
