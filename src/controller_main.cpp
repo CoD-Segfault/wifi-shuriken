@@ -350,6 +350,9 @@ void setup() {
 
   // Initialize SPI1 for scanner communication
   controllerScannerRuntimeInitBus();
+  controllerScannerRuntimeHandleScannerUpdatesFromSd(sd,
+                                                     logging_state.sd_ready,
+                                                     Serial);
 
 #if SCANNER_USE_SHIFTREG_CS
   serialPrintfNormalized("SPI1 initialized (shift-register scanner CS enabled, slots=%u).\n",

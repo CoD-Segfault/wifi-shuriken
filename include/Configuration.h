@@ -183,6 +183,46 @@
 #define CONTROLLER_SD_UPDATE_CHUNK_BYTES 1024
 #endif
 
+// SD-card firmware update settings for attached ESP32-C5 scanner builds. When
+// scanner.bin is present, the controller sends it over the scanner SPI bus at
+// boot before core1 starts normal scan scheduling.
+#ifndef SCANNER_SPI_UPDATE_ENABLED
+#define SCANNER_SPI_UPDATE_ENABLED 1
+#endif
+#ifndef SCANNER_SPI_UPDATE_PATH
+#define SCANNER_SPI_UPDATE_PATH "/scanner.bin"
+#endif
+#ifndef SCANNER_SPI_UPDATE_APPLIED_PATH
+#define SCANNER_SPI_UPDATE_APPLIED_PATH "/scanner.applied.bin"
+#endif
+#ifndef SCANNER_SPI_UPDATE_FILE_CHUNK_BYTES
+#define SCANNER_SPI_UPDATE_FILE_CHUNK_BYTES 512
+#endif
+#ifndef SCANNER_SPI_UPDATE_PACKET_RETRIES
+#define SCANNER_SPI_UPDATE_PACKET_RETRIES 5
+#endif
+#ifndef SCANNER_SPI_UPDATE_CLOCK
+#define SCANNER_SPI_UPDATE_CLOCK 20000000
+#endif
+#ifndef SCANNER_SPI_UPDATE_INTERFRAME_US
+#define SCANNER_SPI_UPDATE_INTERFRAME_US 25
+#endif
+#ifndef SCANNER_SPI_UPDATE_FIRST_PULL_US
+#define SCANNER_SPI_UPDATE_FIRST_PULL_US 100
+#endif
+#ifndef SCANNER_SPI_UPDATE_RESPONSE_PULLS
+#define SCANNER_SPI_UPDATE_RESPONSE_PULLS 500
+#endif
+#if SCANNER_SPI_UPDATE_RESPONSE_PULLS < 1 || SCANNER_SPI_UPDATE_RESPONSE_PULLS > 65535
+#error "SCANNER_SPI_UPDATE_RESPONSE_PULLS must be in [1,65535]"
+#endif
+#ifndef SCANNER_SPI_UPDATE_FLASH_SECTOR_BYTES
+#define SCANNER_SPI_UPDATE_FLASH_SECTOR_BYTES 0
+#endif
+#if SCANNER_SPI_UPDATE_FLASH_SECTOR_BYTES != 0 && SCANNER_SPI_UPDATE_FLASH_SECTOR_BYTES < 48
+#error "SCANNER_SPI_UPDATE_FLASH_SECTOR_BYTES must be 0 or at least 48"
+#endif
+
 // Periodic runtime/GPS status print interval in milliseconds.
 // Set to 0 to disable the periodic summary lines entirely.
 #ifndef PERIODIC_STATUS_INTERVAL_MS

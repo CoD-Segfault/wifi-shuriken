@@ -6,6 +6,7 @@
 #include "scanner_platform_esp32_spi.h"
 #include "ScannerConfiguration.h"
 #include <esp_system.h>
+#include <Update.h>
 
 /*
   ===== SPI RESPONSE TIMING (IMPORTANT) =====
@@ -95,6 +96,28 @@ static uint32_t scan_dedupe_logs = 0;
 // Optional: immediate status for CMD_SCAN response (returned next transaction)
 static int8_t last_scan_status = SCANNER_STATUS_OK;
 
+struct ScannerOtaState {
+  bool active;
+  uint32_t expected_size;
+  uint32_t received_size;
+  uint64_t expected_hash;
+  uint64_t running_hash;
+  uint16_t next_sequence;
+};
+
+static ScannerOtaState ota_state = {};
+static bool ota_restart_pending = false;
+static uint32_t ota_diag_nop_polls = 0;
+static uint32_t ota_diag_data_frames = 0;
+static uint32_t ota_diag_other_frames = 0;
+static OtaAck ota_pending_ack = {};
+static uint8_t ota_pending_ack_tag = CMD_NOP;
+static bool ota_pending_ack_valid = false;
+static constexpr uint16_t OTA_RESTART_DELAY_MS = 100;
+static constexpr uint32_t OTA_DEBUG_SECTOR_BYTES = SCANNER_OTA_DEBUG_SECTOR_BYTES;
+static constexpr uint32_t OTA_DEBUG_EDGE_BYTES = SCANNER_OTA_DEBUG_EDGE_BYTES;
+static constexpr uint32_t OTA_DEBUG_SLOW_WRITE_MS = SCANNER_OTA_DEBUG_SLOW_WRITE_MS;
+
 // ---------- Helpers ----------
 static void scannerStatusLedSet(bool on) {
   if (!SCANNER_STATUS_LED_ENABLED || ((int)SCANNER_STATUS_LED_PIN < 0)) {
@@ -112,6 +135,10 @@ static const char* cmd_to_str(uint8_t cmd) {
     case CMD_RESULT_COUNT: return "RESULT_COUNT";
     case CMD_RESULT_GET: return "RESULT_GET";
     case CMD_DEDUPE_RESET: return "DEDUPE_RESET";
+    case CMD_OTA_BEGIN: return "OTA_BEGIN";
+    case CMD_OTA_DATA: return "OTA_DATA";
+    case CMD_OTA_END: return "OTA_END";
+    case CMD_OTA_ABORT: return "OTA_ABORT";
     default: return "UNKNOWN";
   }
 }
@@ -205,6 +232,131 @@ static void resetDedupeAndBuffers() {
 
 static void write_status_response(int8_t value) {
   memcpy(tx_buf, &value, 1);
+}
+
+static void clearOtaState() {
+  ota_state = {};
+  ota_diag_nop_polls = 0;
+  ota_diag_data_frames = 0;
+  ota_diag_other_frames = 0;
+}
+
+static void clearOtaPendingAck() {
+  ota_pending_ack = {};
+  ota_pending_ack_tag = CMD_NOP;
+  ota_pending_ack_valid = false;
+}
+
+static void abortOtaState() {
+  if (ota_state.active) {
+    Update.abort();
+  }
+  clearOtaState();
+  clearOtaPendingAck();
+  ota_restart_pending = false;
+}
+
+static void write_ota_ack(OtaStatus status, uint32_t detail = 0) {
+  OtaAck ack = {};
+  ack.status = static_cast<int8_t>(status);
+  ack.active = ota_state.active ? 1 : 0;
+  ack.next_sequence = ota_state.next_sequence;
+  ack.offset = ota_state.received_size;
+  ack.detail = detail;
+  ack.image_hash = ota_state.running_hash;
+  memcpy(tx_buf, &ack, sizeof(ack));
+  ota_pending_ack = ack;
+  ota_pending_ack_tag = tx_buf[FRAME_TAG_INDEX];
+  ota_pending_ack_valid = true;
+}
+
+static bool otaShouldLogPacket(uint32_t offset, uint8_t length) {
+#if !SCANNER_OTA_DEBUG_LOG
+  (void)offset;
+  (void)length;
+  return false;
+#else
+  if (offset < 512) {
+    return true;
+  }
+  if (OTA_DEBUG_SECTOR_BYTES == 0) {
+    return false;
+  }
+  const uint32_t sector_offset = offset % OTA_DEBUG_SECTOR_BYTES;
+  const uint32_t end_offset = (offset + length) % OTA_DEBUG_SECTOR_BYTES;
+  if (sector_offset < OTA_DEBUG_EDGE_BYTES ||
+      sector_offset >= (OTA_DEBUG_SECTOR_BYTES - OTA_DEBUG_EDGE_BYTES) ||
+      end_offset < OTA_DEBUG_EDGE_BYTES) {
+    return true;
+  }
+  return false;
+#endif
+}
+
+static void otaLogAck(const char* reason, OtaStatus status, uint32_t detail = 0) {
+#if !SCANNER_OTA_DEBUG_LOG
+  (void)reason;
+  (void)status;
+  (void)detail;
+  return;
+#else
+  SCANNER_LOG_PRINTF("Scanner OTA ack %s: status=%d offset=%lu next_seq=%u detail=0x%08lx active=%u\n",
+                     reason,
+                     (int)status,
+                     (unsigned long)ota_state.received_size,
+                     (unsigned)ota_state.next_sequence,
+                     (unsigned long)detail,
+                     ota_state.active ? 1u : 0u);
+#endif
+}
+
+static void otaLogRawFrame(uint8_t cmd) {
+#if !SCANNER_OTA_DEBUG_LOG
+  (void)cmd;
+  return;
+#else
+  if (!ota_state.active) {
+    return;
+  }
+
+  if (cmd == CMD_NOP) {
+    ota_diag_nop_polls++;
+    if (ota_diag_nop_polls == 1 || ota_diag_nop_polls == 10 ||
+        ota_diag_nop_polls == 100 || ota_diag_nop_polls == 1000 ||
+        (ota_diag_nop_polls % 10000UL) == 0) {
+      SCANNER_LOG_PRINTF("Scanner OTA raw NOP poll count=%lu tx_tag=0x%02X offset=%lu next_seq=%u\n",
+                         (unsigned long)ota_diag_nop_polls,
+                         tx_buf[FRAME_TAG_INDEX],
+                         (unsigned long)ota_state.received_size,
+                         (unsigned)ota_state.next_sequence);
+    }
+    return;
+  }
+
+  if (cmd == CMD_OTA_DATA) {
+    ota_diag_data_frames++;
+    OtaDataCommand data = {};
+    memcpy(&data, rx_buf, sizeof(data));
+    if (!otaShouldLogPacket(data.offset, data.length)) {
+      return;
+    }
+  } else {
+    ota_diag_other_frames++;
+  }
+
+  SCANNER_LOG_PRINTF("Scanner OTA raw cmd=0x%02X data_frames=%lu other=%lu nops=%lu hdr=%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X tag=0x%02X offset=%lu next_seq=%u\n",
+                     cmd,
+                     (unsigned long)ota_diag_data_frames,
+                     (unsigned long)ota_diag_other_frames,
+                     (unsigned long)ota_diag_nop_polls,
+                     rx_buf[0], rx_buf[1], rx_buf[2], rx_buf[3],
+                     rx_buf[4], rx_buf[5], rx_buf[6], rx_buf[7],
+                     rx_buf[8], rx_buf[9], rx_buf[10], rx_buf[11],
+                     rx_buf[FRAME_TAG_INDEX],
+                     (unsigned long)ota_state.received_size,
+                     (unsigned)ota_state.next_sequence);
+  Serial.flush();
+#endif
 }
 
 #if LOG_DEDUPE_HITS
@@ -364,6 +516,21 @@ static void write_result_packet(ResultType type, const WiFiResult* r = nullptr) 
 }
 
 static void handleCmdNop() {
+  if (ota_pending_ack_valid) {
+    memcpy(tx_buf, &ota_pending_ack, sizeof(ota_pending_ack));
+    tx_buf[FRAME_TAG_INDEX] = ota_pending_ack_tag;
+#if SCANNER_OTA_DEBUG_LOG
+    if (ota_state.active && (ota_diag_nop_polls % 50000UL) == 0) {
+      SCANNER_LOG_PRINTF("[SPI] rsp NOP => repeat OTA ack tag=0x%02X status=%d offset=%lu next_seq=%u\n",
+                         ota_pending_ack_tag,
+                         (int)ota_pending_ack.status,
+                         (unsigned long)ota_pending_ack.offset,
+                         (unsigned)ota_pending_ack.next_sequence);
+    }
+#endif
+    return;
+  }
+
   // Return current scanner status/count semantics as a convenience.
   const int8_t c = spi_status;
   write_status_response(c);
@@ -374,7 +541,7 @@ static void handleCmdId() {
   DeviceIdReply id = {};
   id.proto_version = PROTO_VERSION;
   id.scanner_type  = SCANNER_TYPE_ESP32_C5;
-  id.capabilities  = (CAP_BAND_24GHZ | CAP_BAND_5GHZ);
+  id.capabilities  = (CAP_BAND_24GHZ | CAP_BAND_5GHZ | CAP_OTA_UPDATE);
   id.max_results   = PROTO_MAX_RESULTS;
   memcpy(tx_buf, &id, sizeof(id));
   DBG_PRINTF("[SPI] rsp ID => proto=%u type=%u caps=0x%02X max=%u\n",
@@ -455,6 +622,225 @@ static void handleCmdDedupeReset() {
   DBG_PRINTLN("[SPI] rsp DEDUPE_RESET => OK");
 }
 
+static void handleCmdOtaBegin() {
+  OtaBeginCommand begin = {};
+  memcpy(&begin, rx_buf, sizeof(begin));
+
+  if (scan_phase != ScanPhase::Idle || spi_status != SCANNER_STATUS_OK) {
+    write_ota_ack(OTA_STATUS_BUSY);
+    DBG_PRINTLN("[SPI] rsp OTA_BEGIN => BUSY");
+    return;
+  }
+
+  if (begin.image_size == 0 ||
+      begin.packet_data_bytes == 0 ||
+      begin.packet_data_bytes > OTA_DATA_BYTES_PER_FRAME) {
+    write_ota_ack(OTA_STATUS_INVALID);
+    DBG_PRINTLN("[SPI] rsp OTA_BEGIN => INVALID");
+    return;
+  }
+
+  abortOtaState();
+  clear_spi_result_buffer();
+  scannerStatusLedSet(true);
+
+  if (!Update.begin(begin.image_size, U_FLASH)) {
+    clearOtaState();
+    scannerStatusLedSet(false);
+    write_ota_ack(OTA_STATUS_BEGIN_FAILED);
+    SCANNER_LOG_PRINTLN("Scanner OTA begin failed");
+    return;
+  }
+
+  ota_state.active = true;
+  ota_state.expected_size = begin.image_size;
+  ota_state.received_size = 0;
+  ota_state.expected_hash = begin.image_hash;
+  ota_state.running_hash = OTA_HASH64_INIT;
+  ota_state.next_sequence = 0;
+  write_ota_ack(OTA_STATUS_OK);
+  SCANNER_LOG_PRINTF("Scanner OTA begin: %lu bytes hash=0x%08lx%08lx\n",
+                     (unsigned long)ota_state.expected_size,
+                     (unsigned long)(ota_state.expected_hash >> 32),
+                     (unsigned long)(ota_state.expected_hash & 0xffffffffUL));
+}
+
+static void handleCmdOtaData() {
+  OtaDataCommand data = {};
+  memcpy(&data, rx_buf, sizeof(data));
+
+  if (!ota_state.active) {
+    otaLogAck("data-not-active", OTA_STATUS_NOT_ACTIVE);
+    write_ota_ack(OTA_STATUS_NOT_ACTIVE);
+    return;
+  }
+  if (data.length == 0 || data.length > OTA_DATA_BYTES_PER_FRAME ||
+      data.offset > ota_state.expected_size ||
+      data.length > (ota_state.expected_size - data.offset)) {
+#if SCANNER_OTA_DEBUG_LOG
+    SCANNER_LOG_PRINTF("Scanner OTA invalid data: seq=%u expected_seq=%u offset=%lu received=%lu len=%u size=%lu\n",
+                       (unsigned)data.sequence,
+                       (unsigned)ota_state.next_sequence,
+                       (unsigned long)data.offset,
+                       (unsigned long)ota_state.received_size,
+                       (unsigned)data.length,
+                       (unsigned long)ota_state.expected_size);
+#endif
+    otaLogAck("data-invalid", OTA_STATUS_INVALID);
+    write_ota_ack(OTA_STATUS_INVALID);
+    return;
+  }
+  if (data.sequence != ota_state.next_sequence || data.offset != ota_state.received_size) {
+#if SCANNER_OTA_DEBUG_LOG
+    SCANNER_LOG_PRINTF("Scanner OTA sequence mismatch: seq=%u expected_seq=%u offset=%lu received=%lu len=%u\n",
+                       (unsigned)data.sequence,
+                       (unsigned)ota_state.next_sequence,
+                       (unsigned long)data.offset,
+                       (unsigned long)ota_state.received_size,
+                       (unsigned)data.length);
+#endif
+    otaLogAck("data-sequence", OTA_STATUS_SEQUENCE_MISMATCH,
+              static_cast<uint32_t>(ota_state.next_sequence));
+    write_ota_ack(OTA_STATUS_SEQUENCE_MISMATCH,
+                  static_cast<uint32_t>(ota_state.next_sequence));
+    return;
+  }
+
+  const uint32_t actual_crc = otaCrc32(data.data, data.length);
+  if (actual_crc != data.crc32) {
+#if SCANNER_OTA_DEBUG_LOG
+    SCANNER_LOG_PRINTF("Scanner OTA CRC mismatch: seq=%u offset=%lu len=%u rx=0x%08lx actual=0x%08lx\n",
+                       (unsigned)data.sequence,
+                       (unsigned long)data.offset,
+                       (unsigned)data.length,
+                       (unsigned long)data.crc32,
+                       (unsigned long)actual_crc);
+#endif
+    otaLogAck("data-crc", OTA_STATUS_CRC_MISMATCH, actual_crc);
+    write_ota_ack(OTA_STATUS_CRC_MISMATCH, actual_crc);
+    return;
+  }
+
+  const bool log_packet = otaShouldLogPacket(data.offset, data.length);
+  if (log_packet) {
+    SCANNER_LOG_PRINTF("Scanner OTA write begin: seq=%u offset=%lu len=%u sector_off=%lu crc=0x%08lx received=%lu\n",
+                       (unsigned)data.sequence,
+                       (unsigned long)data.offset,
+                       (unsigned)data.length,
+                       (unsigned long)(data.offset % OTA_DEBUG_SECTOR_BYTES),
+                       (unsigned long)data.crc32,
+                       (unsigned long)ota_state.received_size);
+#if SCANNER_SERIAL_LOG
+    Serial.flush();
+#endif
+  }
+
+  const uint32_t write_start_ms = millis();
+  const size_t written = Update.write(data.data, data.length);
+  const uint32_t write_elapsed_ms = millis() - write_start_ms;
+  if (SCANNER_OTA_DEBUG_LOG &&
+      (log_packet || write_elapsed_ms >= OTA_DEBUG_SLOW_WRITE_MS)) {
+    SCANNER_LOG_PRINTF("Scanner OTA write end: seq=%u offset=%lu len=%u written=%u elapsed=%lums\n",
+                       (unsigned)data.sequence,
+                       (unsigned long)data.offset,
+                       (unsigned)data.length,
+                       (unsigned)written,
+                       (unsigned long)write_elapsed_ms);
+  }
+
+  if (written != data.length) {
+    Update.abort();
+    clearOtaState();
+    scannerStatusLedSet(false);
+    otaLogAck("data-write-failed", OTA_STATUS_WRITE_FAILED,
+              static_cast<uint32_t>(written));
+    write_ota_ack(OTA_STATUS_WRITE_FAILED, static_cast<uint32_t>(written));
+    SCANNER_LOG_PRINTLN("Scanner OTA flash write failed");
+    return;
+  }
+
+  ota_state.running_hash = otaHash64Update(ota_state.running_hash,
+                                           data.data,
+                                           data.length);
+  ota_state.received_size += data.length;
+  ota_state.next_sequence++;
+  if (log_packet) {
+    SCANNER_LOG_PRINTF("Scanner OTA data accepted: new_offset=%lu next_seq=%u hash=0x%08lx%08lx\n",
+                       (unsigned long)ota_state.received_size,
+                       (unsigned)ota_state.next_sequence,
+                       (unsigned long)(ota_state.running_hash >> 32),
+                       (unsigned long)(ota_state.running_hash & 0xffffffffUL));
+  }
+  write_ota_ack(OTA_STATUS_OK);
+}
+
+static void handleCmdOtaEnd() {
+  OtaEndCommand end = {};
+  memcpy(&end, rx_buf, sizeof(end));
+
+  if (!ota_state.active) {
+    write_ota_ack(OTA_STATUS_NOT_ACTIVE);
+    return;
+  }
+  if (end.image_size != ota_state.expected_size ||
+      end.image_hash != ota_state.expected_hash ||
+      ota_state.received_size != ota_state.expected_size) {
+    Update.abort();
+    clearOtaState();
+    scannerStatusLedSet(false);
+    write_ota_ack(OTA_STATUS_SIZE_MISMATCH);
+    SCANNER_LOG_PRINTLN("Scanner OTA size mismatch; aborted");
+    return;
+  }
+  if (ota_state.running_hash != ota_state.expected_hash) {
+    const uint64_t actual_hash = ota_state.running_hash;
+    Update.abort();
+    clearOtaState();
+    scannerStatusLedSet(false);
+    write_ota_ack(OTA_STATUS_HASH_MISMATCH,
+                  static_cast<uint32_t>(actual_hash & 0xffffffffUL));
+    SCANNER_LOG_PRINTF("Scanner OTA hash mismatch: actual=0x%08lx%08lx expected=0x%08lx%08lx\n",
+                       (unsigned long)(actual_hash >> 32),
+                       (unsigned long)(actual_hash & 0xffffffffUL),
+                       (unsigned long)(end.image_hash >> 32),
+                       (unsigned long)(end.image_hash & 0xffffffffUL));
+    return;
+  }
+
+  const uint64_t final_hash = ota_state.running_hash;
+  if (!Update.end(true)) {
+    Update.abort();
+    clearOtaState();
+    scannerStatusLedSet(false);
+    write_ota_ack(OTA_STATUS_END_FAILED);
+    SCANNER_LOG_PRINTLN("Scanner OTA commit failed");
+    return;
+  }
+
+  write_ota_ack(OTA_STATUS_OK);
+  SCANNER_LOG_PRINTF("Scanner OTA committed: %lu bytes hash=0x%08lx%08lx; restarting\n",
+                     (unsigned long)ota_state.received_size,
+                     (unsigned long)(final_hash >> 32),
+                     (unsigned long)(final_hash & 0xffffffffUL));
+  clearOtaState();
+  ota_restart_pending = true;
+}
+
+static void handleCmdOtaAbort() {
+#if SCANNER_OTA_DEBUG_LOG
+  SCANNER_LOG_PRINTF("Scanner OTA abort summary before reset: offset=%lu next_seq=%u data_frames=%lu other=%lu nops=%lu\n",
+                     (unsigned long)ota_state.received_size,
+                     (unsigned)ota_state.next_sequence,
+                     (unsigned long)ota_diag_data_frames,
+                     (unsigned long)ota_diag_other_frames,
+                     (unsigned long)ota_diag_nop_polls);
+#endif
+  abortOtaState();
+  scannerStatusLedSet(false);
+  write_ota_ack(OTA_STATUS_OK);
+  SCANNER_LOG_PRINTLN("Scanner OTA aborted by controller");
+}
+
 // ---------- Command handling ----------
 // This fills tx_buf with the *next* response (to be clocked out on the next transaction).
 static void handle_command(uint8_t cmd_byte) {
@@ -462,6 +848,9 @@ static void handle_command(uint8_t cmd_byte) {
   memset(tx_buf, 0, FRAME_SIZE);
   // Tag the frame with the command this response corresponds to.
   tx_buf[FRAME_TAG_INDEX] = cmd_byte;
+  if (cmd_byte != CMD_NOP) {
+    clearOtaPendingAck();
+  }
 
   const SpiCommand cmd = static_cast<SpiCommand>(cmd_byte);
   DBG_PRINTF("[SPI] cmd=0x%02X (%s) rx[1..3]=%u,%u,%u\n",
@@ -474,6 +863,10 @@ static void handle_command(uint8_t cmd_byte) {
     case CMD_RESULT_COUNT: handleCmdResultCount(); break;
     case CMD_RESULT_GET: handleCmdResultGet(); break;
     case CMD_DEDUPE_RESET: handleCmdDedupeReset(); break;
+    case CMD_OTA_BEGIN: handleCmdOtaBegin(); break;
+    case CMD_OTA_DATA: handleCmdOtaData(); break;
+    case CMD_OTA_END: handleCmdOtaEnd(); break;
+    case CMD_OTA_ABORT: handleCmdOtaAbort(); break;
 
     default:
       // Unknown command: return 0
@@ -543,8 +936,14 @@ void loop() {
     return;
   }
 
+  if (ota_restart_pending) {
+    delay(OTA_RESTART_DELAY_MS);
+    ESP.restart();
+  }
+
   // Transaction completed: rx_buf now contains the command from the master.
   const uint8_t cmd = rx_buf[0];
+  otaLogRawFrame(cmd);
 
   // Prepare response for the NEXT transaction (pipelined slave semantics).
   // Keep handlers short here: doing extra scan/Wi-Fi work in this critical path

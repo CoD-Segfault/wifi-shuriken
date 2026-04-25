@@ -43,6 +43,13 @@ static constexpr uint8_t SCANNER_RESULT_GET_CMD_RETRIES = 2;
 static constexpr uint16_t SCANNER_SCAN_FIRST_PULL_US = 3000;
 static constexpr uint8_t SCANNER_SCAN_BUSY_CONFIRM_POLLS = 2;
 static constexpr uint16_t SCANNER_SCAN_BUSY_CONFIRM_DELAY_US = 2500;
+static constexpr uint32_t SCANNER_OTA_SPI_HZ = SCANNER_SPI_UPDATE_CLOCK;
+static constexpr uint16_t SCANNER_OTA_FIRST_PULL_US = SCANNER_SPI_UPDATE_FIRST_PULL_US;
+static constexpr uint16_t SCANNER_OTA_RESPONSE_PULLS = SCANNER_SPI_UPDATE_RESPONSE_PULLS;
+static constexpr uint16_t SCANNER_OTA_INTERFRAME_US = SCANNER_SPI_UPDATE_INTERFRAME_US;
+static constexpr uint32_t SCANNER_OTA_PROGRESS_BYTES = 32768;
+static constexpr uint16_t SCANNER_OTA_POST_SLOT_DELAY_MS = 250;
+static constexpr uint16_t SCANNER_OTA_FLASH_SECTOR_BYTES = SCANNER_SPI_UPDATE_FLASH_SECTOR_BYTES;
 // Scanner transport hardware config (mapped from legacy config macro names).
 static constexpr int SCANNER_PIN_SCK = ESP_PIN_SCK;
 static constexpr int SCANNER_PIN_MOSI = ESP_PIN_MOSI;
@@ -105,6 +112,7 @@ static ChannelScheduleState scanner_schedule_state = {};
 static bool scanner_sweep_timing_active = false;
 static uint32_t scanner_sweep_started_ms = 0;
 static uint8_t scanner_slot = SCANNER_INITIAL_SLOT;
+static bool scanner_ota_transport_active = false;
 
 static void scannerSerialQueueTry(const char* text) {
   if (scanner_runtime_context.serial_queue_try != nullptr) {
@@ -219,7 +227,8 @@ static void scannerTransferFrame(const uint8_t* tx, uint8_t* rx) {
 #else
   digitalWrite(SCANNER_PIN_CS, LOW);
 #endif
-  SPI1.beginTransaction(SPISettings(SCANNER_SPI_HZ, MSBFIRST, SPI_MODE0));
+  const uint32_t spi_hz = scanner_ota_transport_active ? SCANNER_OTA_SPI_HZ : SCANNER_SPI_HZ;
+  SPI1.beginTransaction(SPISettings(spi_hz, MSBFIRST, SPI_MODE0));
 
   // The slave protocol is fixed-length and full-duplex, so every command and
   // poll is exactly one 64-byte transfer.
@@ -246,6 +255,14 @@ static inline void scannerInterframeWait() {
   // frames to let the response buffer settle.
   if (SCANNER_INTERFRAME_US > 0) {
     delayMicroseconds(SCANNER_INTERFRAME_US);
+  }
+}
+
+static inline void scannerOtaInterframeWait() {
+  if (SCANNER_OTA_INTERFRAME_US > 0) {
+    delayMicroseconds(SCANNER_OTA_INTERFRAME_US);
+  } else {
+    scannerInterframeWait();
   }
 }
 
@@ -353,6 +370,545 @@ static bool scannerGetDeviceId(DeviceIdReply& out) {
     delay(1);
   }
   return false;
+}
+
+static const char* scannerOtaStatusToString(int8_t status) {
+  switch (status) {
+    case OTA_STATUS_OK: return "OK";
+    case OTA_STATUS_BUSY: return "BUSY";
+    case OTA_STATUS_INVALID: return "INVALID";
+    case OTA_STATUS_NOT_ACTIVE: return "NOT_ACTIVE";
+    case OTA_STATUS_SEQUENCE_MISMATCH: return "SEQUENCE_MISMATCH";
+    case OTA_STATUS_CRC_MISMATCH: return "CRC_MISMATCH";
+    case OTA_STATUS_WRITE_FAILED: return "WRITE_FAILED";
+    case OTA_STATUS_SIZE_MISMATCH: return "SIZE_MISMATCH";
+    case OTA_STATUS_HASH_MISMATCH: return "HASH_MISMATCH";
+    case OTA_STATUS_BEGIN_FAILED: return "BEGIN_FAILED";
+    case OTA_STATUS_END_FAILED: return "END_FAILED";
+    default: return "UNKNOWN";
+  }
+}
+
+static bool scannerOtaCommandWithAck(const uint8_t* cmd_frame,
+                                     uint8_t expected_cmd_tag,
+                                     OtaAck& ack,
+                                     uint16_t max_pulls = SCANNER_OTA_RESPONSE_PULLS,
+                                     uint32_t expected_offset = UINT32_MAX,
+                                     uint16_t expected_next_sequence = UINT16_MAX) {
+  uint8_t rx[SCANNER_FRAME_SIZE] = {0};
+  uint8_t nop[SCANNER_FRAME_SIZE] = {0};
+  nop[0] = CMD_NOP;
+
+  auto frameLooksLikeAck = [&](const uint8_t* frame) -> bool {
+    OtaAck candidate = {};
+    memcpy(&candidate, frame, sizeof(candidate));
+    const bool tag_match = frame[SCANNER_FRAME_TAG_INDEX] == expected_cmd_tag;
+    const bool payload_match =
+        candidate.active != 0 &&
+        candidate.status <= OTA_STATUS_OK &&
+        candidate.status >= OTA_STATUS_END_FAILED &&
+        (expected_offset == UINT32_MAX || candidate.offset == expected_offset) &&
+        (expected_next_sequence == UINT16_MAX ||
+         candidate.next_sequence == expected_next_sequence);
+
+    if (tag_match || payload_match) {
+      ack = candidate;
+      return true;
+    }
+    return false;
+  };
+
+  scannerTransferFrame(cmd_frame, rx);
+  if (frameLooksLikeAck(rx)) {
+    return true;
+  }
+  if (SCANNER_OTA_FIRST_PULL_US > 0) {
+    delayMicroseconds(SCANNER_OTA_FIRST_PULL_US);
+  }
+
+  for (uint16_t pull = 0; pull < max_pulls; pull++) {
+    scannerTransferFrame(nop, rx);
+    if (frameLooksLikeAck(rx)) {
+      return true;
+    }
+    scannerOtaInterframeWait();
+  }
+
+  return false;
+}
+
+static bool scannerOtaAbortActiveTransfer() {
+  uint8_t tx[SCANNER_FRAME_SIZE] = {0};
+  OtaAck ack = {};
+  tx[0] = CMD_OTA_ABORT;
+  return scannerOtaCommandWithAck(tx, CMD_OTA_ABORT, ack, 80) &&
+         ack.status == OTA_STATUS_OK;
+}
+
+static bool scannerOtaReadImageHash(FsFile& source,
+                                    uint32_t image_size,
+                                    uint64_t& image_hash,
+                                    Stream& serial) {
+  if (!source.seekSet(0)) {
+    serial.println("scanner.bin seek failed before hashing");
+    return false;
+  }
+
+  uint8_t buffer[SCANNER_SPI_UPDATE_FILE_CHUNK_BYTES] = {};
+  uint64_t hash = OTA_HASH64_INIT;
+  uint32_t total_read = 0;
+  while (total_read < image_size) {
+    const uint32_t remaining = image_size - total_read;
+    const size_t want = (remaining < sizeof(buffer)) ? remaining : sizeof(buffer);
+    const int bytes_read = source.read(buffer, want);
+    if (bytes_read <= 0) {
+      serial.println("scanner.bin read failed while hashing");
+      return false;
+    }
+    hash = otaHash64Update(hash, buffer, static_cast<size_t>(bytes_read));
+    total_read += static_cast<uint32_t>(bytes_read);
+  }
+
+  image_hash = hash;
+  return source.seekSet(0);
+}
+
+static bool scannerOtaSendBegin(uint32_t image_size,
+                                uint64_t image_hash,
+                                Stream& serial,
+                                uint8_t slot) {
+  OtaBeginCommand begin = {};
+  begin.cmd = CMD_OTA_BEGIN;
+  begin.packet_data_bytes = OTA_DATA_BYTES_PER_FRAME;
+  begin.image_size = image_size;
+  begin.image_hash = image_hash;
+
+  OtaAck ack = {};
+  if (!scannerOtaCommandWithAck(reinterpret_cast<const uint8_t*>(&begin),
+                                CMD_OTA_BEGIN,
+                                ack,
+                                SCANNER_OTA_RESPONSE_PULLS,
+                                0,
+                                0)) {
+    serial.print("S");
+    serial.print(slot);
+    serial.println(" scanner OTA begin timed out");
+    return false;
+  }
+  if (ack.status != OTA_STATUS_OK) {
+    serial.print("S");
+    serial.print(slot);
+    serial.print(" scanner OTA begin rejected: ");
+    serial.println(scannerOtaStatusToString(ack.status));
+    return false;
+  }
+  return true;
+}
+
+static bool scannerOtaShouldLogPacket(uint32_t offset, uint8_t length);
+
+static bool scannerOtaSendDataPacket(const OtaDataCommand& packet,
+                                     uint32_t next_offset,
+                                     Stream& serial,
+                                     uint8_t slot) {
+  uint8_t nop[SCANNER_FRAME_SIZE] = {0};
+  nop[0] = CMD_NOP;
+
+  for (uint8_t attempt = 0; attempt < SCANNER_SPI_UPDATE_PACKET_RETRIES; attempt++) {
+    uint8_t rx[SCANNER_FRAME_SIZE] = {0};
+    OtaAck ack = {};
+    const auto frameLooksLikeDataAck = [&](const uint8_t* frame) -> bool {
+      OtaAck candidate = {};
+      memcpy(&candidate, frame, sizeof(candidate));
+      const bool tag_match = frame[SCANNER_FRAME_TAG_INDEX] == CMD_OTA_DATA;
+      const bool payload_match =
+          candidate.active != 0 &&
+          candidate.status <= OTA_STATUS_OK &&
+          candidate.status >= OTA_STATUS_END_FAILED &&
+          candidate.offset == next_offset &&
+          (candidate.next_sequence == static_cast<uint16_t>(packet.sequence + 1) ||
+           candidate.status == OTA_STATUS_SEQUENCE_MISMATCH);
+      if (tag_match || payload_match) {
+        ack = candidate;
+        return true;
+      }
+      return false;
+    };
+
+    scannerTransferFrame(reinterpret_cast<const uint8_t*>(&packet), rx);
+    if (frameLooksLikeDataAck(rx)) {
+      if (ack.status == OTA_STATUS_OK && ack.offset == next_offset) {
+        return true;
+      }
+      if (ack.status == OTA_STATUS_SEQUENCE_MISMATCH && ack.offset == next_offset) {
+        return true;
+      }
+      // Same command tag is used for every OTA data packet, so a delayed ACK
+      // for the prior packet can arrive here. Keep polling unless the scanner
+      // reports a non-recoverable error for this transfer.
+      if (ack.status != OTA_STATUS_OK &&
+          ack.status != OTA_STATUS_CRC_MISMATCH &&
+          ack.status != OTA_STATUS_SEQUENCE_MISMATCH) {
+        serial.print("S");
+        serial.print(slot);
+        serial.print(" scanner OTA data failed at offset ");
+        serial.print(packet.offset);
+        serial.print(": ");
+        serial.println(scannerOtaStatusToString(ack.status));
+        return false;
+      }
+    }
+
+    if (SCANNER_OTA_FIRST_PULL_US > 0) {
+      delayMicroseconds(SCANNER_OTA_FIRST_PULL_US);
+    }
+
+    for (uint16_t pull = 0; pull < SCANNER_OTA_RESPONSE_PULLS; pull++) {
+      scannerTransferFrame(nop, rx);
+      if (!frameLooksLikeDataAck(rx)) {
+        scannerOtaInterframeWait();
+        continue;
+      }
+
+      if (ack.status == OTA_STATUS_OK && ack.offset == next_offset) {
+        if (scannerOtaShouldLogPacket(packet.offset, packet.length)) {
+          serial.print("S");
+          serial.print(slot);
+          serial.print(" scanner OTA ACK data seq=");
+          serial.print(packet.sequence);
+          serial.print(" offset=");
+          serial.print(packet.offset);
+          serial.print(" after_pulls=");
+          serial.println(pull + 1);
+        }
+        return true;
+      }
+
+      // A lost ACK can make the controller retry a packet the scanner already
+      // accepted. Treat the scanner's advanced offset as idempotent success.
+      if (ack.status == OTA_STATUS_SEQUENCE_MISMATCH && ack.offset == next_offset) {
+        return true;
+      }
+
+      if (ack.status == OTA_STATUS_CRC_MISMATCH ||
+          ack.status == OTA_STATUS_SEQUENCE_MISMATCH ||
+          (ack.status == OTA_STATUS_OK && ack.offset < next_offset)) {
+        scannerOtaInterframeWait();
+        continue;
+      }
+
+      serial.print("S");
+      serial.print(slot);
+      serial.print(" scanner OTA data failed at offset ");
+      serial.print(packet.offset);
+      serial.print(": ");
+      serial.println(scannerOtaStatusToString(ack.status));
+      return false;
+    }
+  }
+
+  serial.print("S");
+  serial.print(slot);
+  serial.print(" scanner OTA data timed out at offset ");
+  serial.println(packet.offset);
+  return false;
+}
+
+static bool scannerOtaSendEnd(uint32_t image_size,
+                              uint64_t image_hash,
+                              Stream& serial,
+                              uint8_t slot) {
+  OtaEndCommand end = {};
+  end.cmd = CMD_OTA_END;
+  end.image_size = image_size;
+  end.image_hash = image_hash;
+
+  OtaAck ack = {};
+  if (!scannerOtaCommandWithAck(reinterpret_cast<const uint8_t*>(&end),
+                                CMD_OTA_END,
+                                ack,
+                                SCANNER_OTA_RESPONSE_PULLS,
+                                image_size,
+                                UINT16_MAX)) {
+    serial.print("S");
+    serial.print(slot);
+    serial.println(" scanner OTA end timed out");
+    return false;
+  }
+  if (ack.status != OTA_STATUS_OK) {
+    serial.print("S");
+    serial.print(slot);
+    serial.print(" scanner OTA end rejected: ");
+    serial.println(scannerOtaStatusToString(ack.status));
+    return false;
+  }
+  return true;
+}
+
+static bool scannerOtaShouldLogPacket(uint32_t offset, uint8_t length) {
+  if (offset < 512) {
+    return true;
+  }
+#if SCANNER_SPI_UPDATE_FLASH_SECTOR_BYTES == 0
+  (void)length;
+  return false;
+#else
+  const uint32_t sector_offset = offset % SCANNER_OTA_FLASH_SECTOR_BYTES;
+  const uint32_t end_offset = (offset + length) % SCANNER_OTA_FLASH_SECTOR_BYTES;
+  return sector_offset < 128 ||
+         sector_offset >= (SCANNER_OTA_FLASH_SECTOR_BYTES - 128) ||
+         end_offset < 128;
+#endif
+}
+
+static bool scannerOtaTransferImageToSlot(SdFat& sd,
+                                          uint8_t slot,
+                                          uint32_t image_size,
+                                          uint64_t image_hash,
+                                          Stream& serial) {
+  scanner_ota_transport_active = true;
+
+  FsFile source = sd.open(SCANNER_SPI_UPDATE_PATH, O_RDONLY);
+  if (!source) {
+    serial.println("scanner.bin disappeared before scanner OTA");
+    scanner_ota_transport_active = false;
+    return false;
+  }
+  if (!source.seekSet(0)) {
+    serial.println("scanner.bin seek failed before scanner OTA");
+    source.close();
+    scanner_ota_transport_active = false;
+    return false;
+  }
+
+  scannerSetActiveSlot(slot);
+  scannerDrainStaleFrames(2);
+
+  if (!scannerOtaSendBegin(image_size, image_hash, serial, slot)) {
+    source.close();
+    scanner_ota_transport_active = false;
+    return false;
+  }
+
+  uint32_t offset = 0;
+  uint16_t sequence = 0;
+  uint32_t next_progress = SCANNER_OTA_PROGRESS_BYTES;
+  while (offset < image_size) {
+    OtaDataCommand packet = {};
+    packet.cmd = CMD_OTA_DATA;
+    packet.sequence = sequence;
+    packet.offset = offset;
+
+    const uint32_t remaining = image_size - offset;
+    uint32_t packet_limit = OTA_DATA_BYTES_PER_FRAME;
+#if SCANNER_SPI_UPDATE_FLASH_SECTOR_BYTES != 0
+    const uint32_t sector_offset = offset % SCANNER_OTA_FLASH_SECTOR_BYTES;
+    if (sector_offset != 0) {
+      const uint32_t bytes_to_sector_end =
+          SCANNER_OTA_FLASH_SECTOR_BYTES - sector_offset;
+      if (bytes_to_sector_end < packet_limit) {
+        packet_limit = bytes_to_sector_end;
+      }
+    }
+#endif
+    const uint8_t want = (remaining < packet_limit)
+      ? static_cast<uint8_t>(remaining)
+      : static_cast<uint8_t>(packet_limit);
+    const int bytes_read = source.read(packet.data, want);
+    if (bytes_read != want) {
+      serial.print("S");
+      serial.print(slot);
+      serial.println(" scanner.bin read failed during scanner OTA");
+      scannerOtaAbortActiveTransfer();
+      source.close();
+      scanner_ota_transport_active = false;
+      return false;
+    }
+
+    packet.length = want;
+    packet.crc32 = otaCrc32(packet.data, packet.length);
+    const uint32_t next_offset = offset + packet.length;
+    if (scannerOtaShouldLogPacket(packet.offset, packet.length)) {
+      serial.print("S");
+      serial.print(slot);
+      serial.print(" scanner OTA TX data seq=");
+      serial.print(packet.sequence);
+      serial.print(" offset=");
+      serial.print(packet.offset);
+      serial.print(" len=");
+      serial.print(packet.length);
+#if SCANNER_SPI_UPDATE_FLASH_SECTOR_BYTES != 0
+      serial.print(" sector_off=");
+      serial.print(packet.offset % SCANNER_OTA_FLASH_SECTOR_BYTES);
+#endif
+      serial.print(" next=");
+      serial.print(next_offset);
+      serial.print(" crc=0x");
+      serial.println(packet.crc32, HEX);
+    }
+    if (!scannerOtaSendDataPacket(packet, next_offset, serial, slot)) {
+      scannerOtaAbortActiveTransfer();
+      source.close();
+      scanner_ota_transport_active = false;
+      return false;
+    }
+
+    offset = next_offset;
+    sequence++;
+
+    if (offset >= next_progress || offset == image_size) {
+      serial.print("S");
+      serial.print(slot);
+      serial.print(" scanner OTA progress ");
+      serial.print(offset);
+      serial.print("/");
+      serial.println(image_size);
+      while (next_progress <= offset) {
+        next_progress += SCANNER_OTA_PROGRESS_BYTES;
+      }
+    }
+  }
+
+  source.close();
+
+  if (!scannerOtaSendEnd(image_size, image_hash, serial, slot)) {
+    scanner_ota_transport_active = false;
+    return false;
+  }
+
+  delay(SCANNER_OTA_POST_SLOT_DELAY_MS);
+  scanner_ota_transport_active = false;
+  return true;
+}
+
+static bool buildScannerAppliedPath(SdFat& sd, char* out, size_t out_len) {
+  const char* const applied_base = SCANNER_SPI_UPDATE_APPLIED_PATH;
+  if (!sd.exists(applied_base)) {
+    snprintf(out, out_len, "%s", applied_base);
+    return true;
+  }
+
+  const char* const slash = strrchr(applied_base, '/');
+  const char* const dot = strrchr(applied_base, '.');
+  const bool has_extension = (dot != nullptr) && (slash == nullptr || dot > slash);
+
+  for (uint16_t suffix = 1; suffix < 100; suffix++) {
+    if (has_extension) {
+      const int stem_len = static_cast<int>(dot - applied_base);
+      snprintf(out, out_len, "%.*s_%02u%s",
+               stem_len, applied_base, (unsigned)suffix, dot);
+    } else {
+      snprintf(out, out_len, "%s_%02u", applied_base, (unsigned)suffix);
+    }
+
+    if (!sd.exists(out)) {
+      return true;
+    }
+  }
+
+  out[0] = '\0';
+  return false;
+}
+
+bool controllerScannerRuntimeHandleScannerUpdatesFromSd(SdFat& sd,
+                                                        bool sd_ready,
+                                                        Stream& serial) {
+#if !SCANNER_SPI_UPDATE_ENABLED
+  (void)sd;
+  (void)sd_ready;
+  (void)serial;
+  return false;
+#else
+  if (!sd_ready || !sd.exists(SCANNER_SPI_UPDATE_PATH)) {
+    return false;
+  }
+
+  FsFile source = sd.open(SCANNER_SPI_UPDATE_PATH, O_RDONLY);
+  if (!source) {
+    serial.println("scanner.bin exists but could not be opened");
+    return false;
+  }
+
+  const uint32_t image_size = static_cast<uint32_t>(source.size());
+  if (image_size == 0) {
+    serial.println("scanner.bin is empty; skipping scanner OTA");
+    source.close();
+    return false;
+  }
+
+  uint64_t image_hash = 0;
+  if (!scannerOtaReadImageHash(source, image_size, image_hash, serial)) {
+    source.close();
+    return false;
+  }
+  source.close();
+
+  serial.print("Scanner SPI OTA image: ");
+  serial.print(image_size);
+  serial.print(" bytes hash=0x");
+  serial.print(static_cast<uint32_t>(image_hash >> 32), HEX);
+  serial.println(static_cast<uint32_t>(image_hash & 0xffffffffUL), HEX);
+
+  uint8_t ota_capable_slots = 0;
+  uint8_t updated_slots = 0;
+  uint8_t failed_slots = 0;
+  for (uint8_t slot = 0; slot < SCANNER_SLOT_COUNT; slot++) {
+    scannerSetActiveSlot(slot);
+    scannerDrainStaleFrames(2);
+
+    DeviceIdReply id = {};
+    if (!scannerGetDeviceId(id)) {
+      continue;
+    }
+    if ((id.capabilities & CAP_OTA_UPDATE) == 0) {
+      serial.print("S");
+      serial.print(slot);
+      serial.println(" scanner does not advertise SPI OTA; skipping");
+      continue;
+    }
+
+    ota_capable_slots++;
+    serial.print("S");
+    serial.print(slot);
+    serial.println(" scanner OTA starting");
+    if (scannerOtaTransferImageToSlot(sd, slot, image_size, image_hash, serial)) {
+      updated_slots++;
+      serial.print("S");
+      serial.print(slot);
+      serial.println(" scanner OTA complete");
+    } else {
+      failed_slots++;
+      serial.print("S");
+      serial.print(slot);
+      serial.println(" scanner OTA failed; leaving scanner.bin for retry");
+    }
+  }
+
+  if (ota_capable_slots == 0) {
+    serial.println("No SPI OTA-capable scanners found; leaving scanner.bin in place");
+    return false;
+  }
+
+  if (failed_slots != 0 || updated_slots != ota_capable_slots) {
+    serial.println("Scanner OTA did not complete for every capable scanner; leaving scanner.bin in place");
+    return updated_slots != 0;
+  }
+
+  char applied_path[56] = {};
+  if (!buildScannerAppliedPath(sd, applied_path, sizeof(applied_path))) {
+    serial.println("Scanner OTA applied, but no free applied filename was available");
+    return true;
+  }
+  if (!sd.rename(SCANNER_SPI_UPDATE_PATH, applied_path)) {
+    serial.print("Scanner OTA applied, but rename failed: ");
+    serial.println(applied_path);
+    return true;
+  }
+
+  serial.print("Scanner OTA applied successfully; renamed SD image to ");
+  serial.println(applied_path);
+  return true;
+#endif
 }
 
 static bool ensureScannerSlotIdentity(uint8_t slot, ScannerSlotState& state) {
