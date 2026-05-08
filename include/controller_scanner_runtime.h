@@ -1,6 +1,10 @@
 #pragma once
 
+#include <Arduino.h>
+#include <SdFat.h>
 #include <stdint.h>
+
+class Adafruit_NeoPixel;
 
 #include "pico/util/queue.h"
 #include "wifi_dedupe.h"
@@ -31,6 +35,13 @@ void controllerScannerRuntimeInitBus();
 // Request a controller-wide dedupe reset from core0. Core1 applies the reset
 // to the master dedupe table and re-arms per-scanner dedupe handshakes.
 void controllerScannerRuntimeRequestDedupeReset();
+
+// Push /scanner.bin to attached ESP32-C5 scanners during the boot-time quiet
+// window before controllerScannerRuntimeRun() starts normal scan scheduling.
+bool controllerScannerRuntimeHandleScannerUpdatesFromSd(SdFat& sd,
+                                                        bool sd_ready,
+                                                        Stream& serial,
+                                                        Adafruit_NeoPixel& pixels);
 
 // Run the scanner service loop on core1 forever.
 void controllerScannerRuntimeRun(const ControllerScannerRuntimeContext& context);

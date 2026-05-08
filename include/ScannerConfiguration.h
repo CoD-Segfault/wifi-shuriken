@@ -40,3 +40,21 @@
 #ifndef DEBUG_SPI_PROTOCOL
 #define DEBUG_SPI_PROTOCOL 0  // 1 enables verbose SPI protocol tracing.
 #endif
+
+// Focused scanner-side diagnostics for SPI OTA bring-up. Logs early packets,
+// flash-sector boundary packets, validation failures, and slow flash writes.
+#ifndef SCANNER_OTA_DEBUG_LOG
+#define SCANNER_OTA_DEBUG_LOG 0
+#endif
+#ifndef SCANNER_OTA_DEBUG_SECTOR_BYTES
+#define SCANNER_OTA_DEBUG_SECTOR_BYTES 4096
+#endif
+#if SCANNER_OTA_DEBUG_SECTOR_BYTES < 1
+#error "SCANNER_OTA_DEBUG_SECTOR_BYTES must be at least 1"
+#endif
+#ifndef SCANNER_OTA_DEBUG_EDGE_BYTES
+#define SCANNER_OTA_DEBUG_EDGE_BYTES 128
+#endif
+#ifndef SCANNER_OTA_DEBUG_SLOW_WRITE_MS
+#define SCANNER_OTA_DEBUG_SLOW_WRITE_MS 20
+#endif
