@@ -17,6 +17,9 @@ using ControllerSerialPrintfFn = void (*)(const char* fmt, ...);
 // Bring up the optional USB CDC passthrough interface used for raw NMEA.
 void controllerGnssRuntimeInitUsbPassthrough();
 
+// Configure the GNSS UART pins, FIFO, target baud rate, and module output.
+void controllerGnssRuntimeBegin();
+
 // Configure the GNSS UART pins, FIFO, and target baud rate.
 void controllerGnssRuntimeInitUart();
 

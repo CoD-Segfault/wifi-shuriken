@@ -101,6 +101,26 @@ void controllerGnssRuntimeInitUart() {
   configureGnssBaudToTarget();
 }
 
+static void configureGnssModuleOutput() {
+  // Configure MTK-compatible modules for 5Hz updates with only GGA/RMC output.
+  controllerGnssRuntimeSendPMTKCommand("$PMTK220,200*2C");
+  controllerGnssRuntimeSendPMTKCommand("$PMTK314,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0*28");
+
+  // Configure LC86G modules for the same 5Hz GGA/RMC-only output.
+  controllerGnssRuntimeSendPMTKCommand("$PAIR050,200*21");
+  controllerGnssRuntimeSendPMTKCommand("$PAIR062,0,1*3F"); // GGA at 1x rate.
+  controllerGnssRuntimeSendPMTKCommand("$PAIR062,1,0*3F"); // GLL off.
+  controllerGnssRuntimeSendPMTKCommand("$PAIR062,2,0*3C"); // GSA off.
+  controllerGnssRuntimeSendPMTKCommand("$PAIR062,3,0*3D"); // GSV off.
+  controllerGnssRuntimeSendPMTKCommand("$PAIR062,4,1*3B"); // RMC at 1x rate.
+  controllerGnssRuntimeSendPMTKCommand("$PAIR062,5,0*3B"); // VTG off.
+}
+
+void controllerGnssRuntimeBegin() {
+  controllerGnssRuntimeInitUart();
+  configureGnssModuleOutput();
+}
+
 bool controllerGnssRuntimeService(TinyGPSPlus& gps,
                                   uint16_t gps_field_max_age_ms) {
   // Keep the GNSS UART drained aggressively so TinyGPS++ parsing and optional

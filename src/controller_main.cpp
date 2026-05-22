@@ -364,23 +364,7 @@ void setup() {
 #if SCANNER_MISO_PULLUP
   Serial.println("Scanner MISO internal pull-up enabled");
 #endif
-  // Initialize GNSS UART
-  controllerGnssRuntimeInitUart();
-
-  // Configure GNSS module for 5Hz update rate and disable unnecessary NMEA sentences
-  controllerGnssRuntimeSendPMTKCommand("$PMTK220,200*2C"); // Set update rate to 5Hz
-  controllerGnssRuntimeSendPMTKCommand("$PMTK314,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0*28"); // Enable GGA and RMC sentences only
-
-  // Set LC86G update rate to 5Hz (200ms interval)
-  controllerGnssRuntimeSendPMTKCommand("$PAIR050,200*21");
-
-  // Disable unnecessary NMEA sentences on LC86G
-  controllerGnssRuntimeSendPMTKCommand("$PAIR062,0,1*3F"); // GGA at 1x rate
-  controllerGnssRuntimeSendPMTKCommand("$PAIR062,1,0*3F"); // GLL off
-  controllerGnssRuntimeSendPMTKCommand("$PAIR062,2,0*3C"); // GSA off
-  controllerGnssRuntimeSendPMTKCommand("$PAIR062,3,0*3D"); // GSV off
-  controllerGnssRuntimeSendPMTKCommand("$PAIR062,4,1*3B"); // RMC at 1x rate
-  controllerGnssRuntimeSendPMTKCommand("$PAIR062,5,0*3B"); // VTG off
+  controllerGnssRuntimeBegin();
 
   // Capture RTC-backed GNSS date/time once per boot for the log filename.
   logging.captureBootTimestampFromGnss();
