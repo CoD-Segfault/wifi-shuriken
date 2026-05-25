@@ -1,7 +1,6 @@
 #include "controller_gnss_runtime.h"
 
 #include <Arduino.h>
-#include <Adafruit_NeoPixel.h>
 #include <TinyGPSPlus.h>
 
 #if defined(USE_TINYUSB)
