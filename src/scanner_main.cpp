@@ -911,7 +911,7 @@ void setup() {
   resetDedupeAndBuffers();
 
   // Boot complete: scanner is ready/idle.
-  scannerStatusLedSet(false);
+  //scannerStatusLedSet(false);
   SCANNER_LOG_PRINTLN("SPI slave ready");
 }
 
