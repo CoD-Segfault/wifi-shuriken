@@ -52,7 +52,9 @@ extern "C" {
 #define CFG_TUD_CDC_RX_BUFSIZE (256)
 #define CFG_TUD_CDC_TX_BUFSIZE (256)
 
-#define CFG_TUD_MTP_EP_BUFSIZE (4096)
+// Larger than the 64-byte full-speed bulk packet so TinyUSB can stream many
+// packets per transfer callback and SdFat can read larger chunks from the card.
+#define CFG_TUD_MTP_EP_BUFSIZE (16384)
 #define CFG_TUD_MTP_EP_CONTROL_BUFSIZE (16)
 
 #define CFG_TUD_MTP_DEVICEINFO_EXTENSIONS "microsoft.com: 1.0; "
