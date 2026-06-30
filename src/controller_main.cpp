@@ -18,6 +18,7 @@
 #include "wifi_dedupe.h"
 #include "Configuration.h"
 #include "controller_gnss_runtime.h"
+#include "controller_mtp_storage.h"
 #include "controller_scanner_runtime.h"
 #include "controller_status.h"
 #include "controller_update_runtime.h"
@@ -159,8 +160,11 @@ static void handleResetButton() {
   }
 
   Serial.println("Reset button pressed, rebooting Pico...");
-  if (logFile) {
-    logFile.flush();
+  if (controllerMtpStorageTryLock()) {
+    if (logFile) {
+      logFile.flush();
+    }
+    controllerMtpStorageUnlock();
   }
   Serial.flush();
   delay(20);
@@ -270,6 +274,7 @@ void loop2() {
 }
 
 void setup() {
+  bool mtp_registered = true;
   // Bring up status LED first so bare-board bring-up has immediate feedback.
 #if RGB_POWER_ENABLED
   pinMode(RGB_POWER_PIN, OUTPUT);
@@ -281,6 +286,7 @@ void setup() {
   pixels.show();
 
 #if defined(USE_TINYUSB)
+  mtp_registered = controllerMtpStorageBegin(sd, logFile);
   TinyUSBDevice.setManufacturerDescriptor(USB_DEVICE_MANUFACTURER_NAME);
   TinyUSBDevice.setProductDescriptor(USB_DEVICE_PRODUCT_NAME);
   if (USB_DEVICE_SERIAL_OVERRIDE[0] != '\0') {
@@ -288,6 +294,9 @@ void setup() {
   }
 #endif
   Serial.begin(115200);
+  if (!mtp_registered) {
+    Serial.println("MTP interface registration failed");
+  }
   controllerGnssRuntimeInitUsbPassthrough();
   // Give USB a moment to enumerate before the startup burst of status prints.
   delay(2000);
@@ -371,6 +380,7 @@ void setup() {
 
   // If SD is present, wait until the clock is usable before creating the CSV so
   // boot-time filenames are timestamped correctly.
+  controllerMtpStorageLock();
   if (logging_state.sd_ready) {
     if (!logging.ensureBootTimestampFromClock()) {
       Serial.println("Waiting for valid GNSS time before creating CSV log file");
@@ -391,6 +401,8 @@ void setup() {
     }
     logging.tryAppendBootResetLog();
   }
+  controllerMtpStorageUnlock();
+  controllerMtpStorageSetReady(logging_state.sd_ready);
 
   // Set up second core loop for SPI communication with scanner
   multicore_launch_core1(loop2);
@@ -415,6 +427,7 @@ void loop() {
     }
   }
 #endif
+  controllerMtpStorageTask();
   handleResetButton();
 
   // Read GNSS data, update the fix LED, and compute the current "usable fix"
@@ -440,22 +453,26 @@ void loop() {
   }
 
   // Drain AP results produced by core1 and handle logging on core0.
-  QueuedScanResult q = {};
-  // Limit per-iteration SD writes so GNSS parsing is serviced frequently.
-  int drained = 0;
-  while (drained < CONTROLLER_SCAN_RESULT_DRAIN_PER_LOOP &&
-         queue_try_remove(&scan_result_queue, &q)) {
-    logging.appendCsvRow(q);
-    drained++;
-  }
-  //reportScannerDropCounters();
-  // Time-based flush closes the durability gap between row-count flushes.
-  logging.flushCsvIfDue();
+  if (controllerMtpStorageTryLock()) {
+    QueuedScanResult q = {};
+    // Limit per-iteration SD writes so GNSS parsing is serviced frequently.
+    int drained = 0;
+    while (drained < CONTROLLER_SCAN_RESULT_DRAIN_PER_LOOP &&
+           queue_try_remove(&scan_result_queue, &q)) {
+      logging.appendCsvRow(q);
+      drained++;
+    }
+    //reportScannerDropCounters();
+    // Time-based flush closes the durability gap between row-count flushes.
+    logging.flushCsvIfDue();
 
-  if (!logging_state.csv_ready) {
-    logging.tryRecoverSdLogging();
+    if (!logging_state.csv_ready) {
+      logging.tryRecoverSdLogging();
+    }
+    logging.tryAppendBootResetLog();
+    controllerMtpStorageSetReady(logging_state.sd_ready);
+    controllerMtpStorageUnlock();
   }
-  logging.tryAppendBootResetLog();
 
   controllerStatusUpdateLed(pixels, controllerStatusCompute(
       logging_state.sd_ready, usable_fix, logging_state.csv_ready));
