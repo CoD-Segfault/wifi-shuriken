@@ -24,9 +24,9 @@ directory.
 
 ### Status & Indicators
 
-RED LED = No SD Card, No SD Card Detected
-AMBER LED = No GPS Lock / No Location Lock
-GREEN LED = GO Go Go - Device operating as expected
+- RED LED = No SD Card, No SD Card Detected
+- AMBER LED = No GPS Lock / No Location Lock
+- GREEN LED = GO Go Go - Device operating as expected
 
 Inside the case - AMBER LEDs are twinkling fast last stars at night on a wonderful drive to WarDrive. 
 These are flickering because they're scanning for the WiFi Beacons
