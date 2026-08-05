@@ -139,6 +139,57 @@
 #define NMEA_PASSTHROUGH 1  // 1 mirrors GNSS NMEA bytes to host output.
 #endif
 
+// Configure u-blox receivers over UBX in addition to the MTK/Quectel sentences.
+// On by default: modules that are not u-blox ignore the binary frames, so the
+// cost of leaving it enabled is a handful of bytes on the GNSS UART at boot.
+#ifndef CONTROLLER_GNSS_UBLOX_CONFIG
+#define CONTROLLER_GNSS_UBLOX_CONFIG 1
+#endif
+
+// Re-enable the GSA and GSV sentences that the normal configuration turns off.
+// Neither is used for logging, but on the raw NMEA passthrough they are the
+// only view of acquisition progress: GSA carries the fix type, and GSV lists
+// satellites in view with their signal strengths. Costs noticeable UART
+// bandwidth at 5Hz, so keep it off unless diagnosing a receiver that will not
+// lock.
+#ifndef CONTROLLER_GNSS_NMEA_DEBUG_SENTENCES
+#define CONTROLLER_GNSS_NMEA_DEBUG_SENTENCES 0
+#endif
+
+// Persist the UBX configuration to the module's battery-backed RAM and flash.
+// Off by default: the configuration is re-sent on every boot anyway, and
+// writing module flash on each power-up wears it for no benefit. Enable it
+// once, for a single boot, if you want the module to keep these settings when
+// used standalone.
+#ifndef CONTROLLER_GNSS_UBLOX_SAVE_CONFIG
+#define CONTROLLER_GNSS_UBLOX_SAVE_CONFIG 0
+#endif
+
+// Re-run GNSS bring-up when the module has produced no bytes at all for this
+// long. The module's configuration lives in its volatile RAM, so a module that
+// power-cycles independently of the controller reverts to factory output and
+// would otherwise stay unusable until the next controller reboot. A healthy
+// module streams continuously even with no fix, so any silence this long means
+// it is contributing nothing and the blocking re-init costs no real data.
+// Set to 0 to disable and keep the boot-only behaviour.
+#ifndef CONTROLLER_GNSS_RECONFIG_IDLE_MS
+#define CONTROLLER_GNSS_RECONFIG_IDLE_MS 10000
+#endif
+#if CONTROLLER_GNSS_RECONFIG_IDLE_MS != 0 && \
+    (CONTROLLER_GNSS_RECONFIG_IDLE_MS < 2000 || CONTROLLER_GNSS_RECONFIG_IDLE_MS > 600000)
+#error "CONTROLLER_GNSS_RECONFIG_IDLE_MS must be 0 or between 2000 and 600000"
+#endif
+
+// Upper bound for the retry interval. Each attempt that fails to produce bytes
+// doubles the wait, up to this cap, so a disconnected or absent module settles
+// into a cheap background poll instead of blocking core0 every interval.
+#ifndef CONTROLLER_GNSS_RECONFIG_MAX_IDLE_MS
+#define CONTROLLER_GNSS_RECONFIG_MAX_IDLE_MS 120000
+#endif
+#if CONTROLLER_GNSS_RECONFIG_MAX_IDLE_MS < CONTROLLER_GNSS_RECONFIG_IDLE_MS
+#error "CONTROLLER_GNSS_RECONFIG_MAX_IDLE_MS must be >= CONTROLLER_GNSS_RECONFIG_IDLE_MS"
+#endif
+
 // Allow core1 worker diagnostics to be queued for core0 serial printing.
 #ifndef CORE1_SERIAL_LOG
 #define CORE1_SERIAL_LOG 1  // 1 enables core1 diagnostic queue logging.
