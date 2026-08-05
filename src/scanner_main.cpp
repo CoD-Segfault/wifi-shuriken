@@ -87,6 +87,8 @@ static int scan_index = 0;     // next raw result index to process
 static WiFiResult spi_results[PROTO_MAX_RESULTS] = {};
 static uint8_t spi_result_count = 0;
 static uint8_t spi_result_index = 0;
+// Set when a result packet is staged in tx_buf but not yet clocked out.
+static bool spi_result_emit_pending = false;
 // Master-visible status: 0=idle, -1=busy (scan/processing), >0=buffered results available.
 static int8_t spi_status = SCANNER_STATUS_OK;
 static uint8_t last_scan_band = 0;
@@ -211,11 +213,34 @@ static void clear_scan_results() {
 static void clear_spi_result_buffer() {
   spi_result_count = 0;
   spi_result_index = 0;
+  spi_result_emit_pending = false;
 }
 
 static inline void setResultBufferIdle() {
   spi_status = SCANNER_STATUS_OK;
   clear_spi_result_buffer();
+}
+
+// A RESULT_GET reply is staged into tx_buf but is not clocked out until the
+// next transaction completes. Advancing the buffer position at staging time
+// discards the record if that transaction never happens, so the advance waits
+// here until the frame has demonstrably gone out on the wire.
+static void commitPendingResultEmit() {
+  if (!spi_result_emit_pending) {
+    return;
+  }
+  spi_result_emit_pending = false;
+  if (spi_result_index >= spi_result_count) {
+    return;
+  }
+
+  spi_result_index++;
+  const int remaining = (int)spi_result_count - (int)spi_result_index;
+  if (remaining > 0) {
+    spi_status = static_cast<int8_t>(remaining);
+  } else {
+    setResultBufferIdle();
+  }
 }
 
 static inline void setScanEngineIdle() {
@@ -600,18 +625,15 @@ static void handleCmdResultGet() {
     return;
   }
 
-  const WiFiResult& r = spi_results[spi_result_index++];
+  // Stage the packet only. commitPendingResultEmit() moves past this record
+  // once the transaction that carries it has completed, so a reply the master
+  // never managed to pull is re-delivered instead of being skipped.
+  const WiFiResult& r = spi_results[spi_result_index];
   write_result_packet(RESULT_WIFI, &r);
-
-  const int remaining = (int)spi_result_count - (int)spi_result_index;
-  if (remaining > 0) {
-    spi_status = static_cast<int8_t>(remaining);
-  } else {
-    setResultBufferIdle();
-  }
+  spi_result_emit_pending = true;
 
   DBG_PRINTF("[SPI] rsp RESULT_GET => WIFI out=%u/%u ssid='%s' rssi=%d ch=%u band=%u\n",
-             (unsigned)spi_result_index, (unsigned)spi_result_count,
+             (unsigned)(spi_result_index + 1), (unsigned)spi_result_count,
              r.ssid, r.rssi, r.channel, r.band);
 }
 
@@ -951,6 +973,10 @@ void loop() {
     DBG_PRINTF("[SPI] spi_slave_transmit error: %d\n", ret);
     return;
   }
+
+  // This transaction clocked out whatever the previous command staged, so a
+  // result packet waiting on that has now reached the master.
+  commitPendingResultEmit();
 
   if (ota_restart_pending) {
     delay(OTA_RESTART_DELAY_MS);

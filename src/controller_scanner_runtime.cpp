@@ -1034,6 +1034,25 @@ static int8_t scannerQueryStatusWithRetry(uint8_t cmd,
   return SCANNER_STATUS_TRANSPORT_TIMEOUT;
 }
 
+// Decode a frame that is tagged as a RESULT_GET reply and carries a payload the
+// protocol defines. Frames tagged for any other command are not results.
+static bool scannerDecodeResultFrame(const uint8_t* rx, WiFiResultPacket& pkt) {
+  if (rx[SCANNER_FRAME_TAG_INDEX] != CMD_RESULT_GET) {
+    return false;
+  }
+
+  WiFiResultPacket candidate = {};
+  memcpy(&candidate, rx, sizeof(candidate));
+  if (candidate.result_type != RESULT_WIFI &&
+      candidate.result_type != RESULT_BUSY &&
+      candidate.result_type != RESULT_END) {
+    return false;
+  }
+
+  pkt = candidate;
+  return true;
+}
+
 static bool scannerGetResult(WiFiResultPacket& pkt) {
   // RESULT_GET is a two-phase exchange: request the next packet, then keep
   // pulling until the scanner returns a tagged result payload.
@@ -1045,27 +1064,27 @@ static bool scannerGetResult(WiFiResultPacket& pkt) {
 
   for (int attempt = 0; attempt < SCANNER_RESULT_GET_CMD_RETRIES; attempt++) {
     scannerTransferFrame(tx, rx);
+
+    // The scanner replies one transaction late, so this command frame clocks
+    // out whatever the previous command staged. After a reply we failed to
+    // pull, that is the record this request would otherwise step over, so it
+    // has to be consumed here rather than discarded. Frames belonging to the
+    // preceding RESULT_COUNT or NOP carry a different tag and are ignored.
+    if (scannerDecodeResultFrame(rx, pkt)) {
+      return true;
+    }
+
     if (SCANNER_STATUS_FIRST_PULL_US > 0) {
       delayMicroseconds(SCANNER_STATUS_FIRST_PULL_US);
     }
 
     for (int pull = 0; pull < SCANNER_RESULT_RESPONSE_PULLS; pull++) {
       scannerTransferFrame(nop, rx);
-      if (rx[SCANNER_FRAME_TAG_INDEX] != CMD_RESULT_GET) {
-        scannerInterframeWait();
-        continue;
-      }
-
-      WiFiResultPacket candidate = {};
-      memcpy(&candidate, rx, sizeof(candidate));
-      if (candidate.result_type == RESULT_WIFI ||
-          candidate.result_type == RESULT_BUSY ||
-          candidate.result_type == RESULT_END) {
-        pkt = candidate;
+      if (scannerDecodeResultFrame(rx, pkt)) {
         return true;
       }
 
-      // Valid tag but invalid payload; keep pulling to find a sane packet.
+      // No reply yet, or a valid tag with an invalid payload; keep pulling.
       scannerInterframeWait();
     }
 
