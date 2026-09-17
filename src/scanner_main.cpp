@@ -54,8 +54,14 @@ static constexpr uint8_t SCAN_RESULT_PROCESS_BUDGET = 16;
 static constexpr size_t FRAME_SIZE = SPI_FRAME_SIZE;
 static constexpr size_t FRAME_TAG_INDEX = SPI_FRAME_TAG_INDEX;
 
-static uint8_t rx_buf[FRAME_SIZE] __attribute__((aligned(4)));
-static uint8_t tx_buf[FRAME_SIZE] __attribute__((aligned(4)));
+// Aligned to a cache line, not just a word. These are DMA targets on a cached
+// chip: a 64-byte buffer aligned only to 4 straddles two cache lines, and the
+// line that DMA does not invalidate keeps serving the CPU its stale cached copy.
+// Since rx_buf is cleared immediately before each transfer is armed, that stale
+// copy reads back as zeros -- which silently blanked every command payload while
+// leaving byte 0 intact.
+static uint8_t rx_buf[FRAME_SIZE] __attribute__((aligned(64)));
+static uint8_t tx_buf[FRAME_SIZE] __attribute__((aligned(64)));
 
 // Boot diagnostics are emitted repeatedly for a short window so they remain visible
 // even when USB CDC enumeration lags behind firmware startup.
@@ -878,6 +884,14 @@ static void handle_command(uint8_t cmd_byte) {
 void setup() {
 #if SCANNER_SERIAL_LOG || DEBUG_SPI_PROTOCOL
   Serial.begin(115200);
+#if defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT
+  // Only the USB CDC has this control; on the devkit Serial is a plain UART.
+  // The CDC blocks by default once its TX buffer fills, which happens as soon
+  // as a host enumerates the port but nothing drains it. A blocking write
+  // inside a command handler delays re-queueing the slave DMA transaction, so
+  // drop console output instead of stalling the SPI critical path.
+  Serial.setTxTimeoutMs(0);
+#endif
 #endif
   boot_reset_reason = esp_reset_reason();
   boot_diag_next_ms = 0;
@@ -920,8 +934,10 @@ void loop() {
   // Always progress scan state even if the master is quiet.
   update_scan_state();
 
-  // Ensure rx_buf doesn't contain stale data (not strictly required, but helps debugging).
-  memset(rx_buf, 0, FRAME_SIZE);
+  // rx_buf is deliberately not cleared here. After a timeout the transaction
+  // stays armed with rx_buf as its DMA target, so the master can complete a
+  // frame into it while this loop is still in update_scan_state() above.
+  // scannerSpiSlaveTransfer() clears it while re-arming instead.
 
   // Wait for a SPI transaction; timeout keeps async scan polling progressing.
   const int ret = scannerSpiSlaveTransfer(tx_buf, rx_buf, FRAME_SIZE, SPI_RX_TIMEOUT_MS);
