@@ -27,6 +27,23 @@
 // This file owns Arduino entrypoints, shared peripherals, cross-core queues,
 // SD/logging lifecycle, and wiring between the GNSS and scanner runtimes.
 
+#if defined(USE_TINYUSB) && defined(ARDUINO_ARCH_RP2040)
+#include <pico/mutex.h>
+// Owned by the Adafruit TinyUSB rp2040 port, where tud_task() runs in IRQ
+// context and is skipped while this mutex is held. Console CDC traffic from
+// thread context claims USB endpoints internally, so it must hold this lock
+// or an interrupting tud_task can deadlock on the usbd endpoint mutex the
+// interrupted code still owns (core0 wedges, watchdog reboots). On this core
+// the IRQ always completes before thread code resumes, so try_enter from
+// thread context effectively always succeeds; failure just drops the output.
+extern mutex_t __usb_mutex;
+static inline bool usbGuardTryEnter() { return mutex_try_enter(&__usb_mutex, NULL); }
+static inline void usbGuardExit() { mutex_exit(&__usb_mutex); }
+#else
+static inline bool usbGuardTryEnter() { return true; }
+static inline void usbGuardExit() {}
+#endif
+
 // Hardware/peripheral instances owned by core0.
 SdFat sd;
 FsFile logFile;
@@ -102,7 +119,41 @@ static const char* controllerResetReasonToString(RP2040::resetReason_t reason) {
 
 // Normalize outgoing console text to CRLF so host tools on Linux and Windows
 // render the controller console consistently.
+// Write one console byte under the USB guard without ever blocking inside the
+// CDC wrapper: the wrapper's own backpressure loop waits for tud_task() to
+// drain the FIFO, which cannot run while we hold the guard, so we only write
+// when space exists and pump tud_task() ourselves otherwise (the pattern the
+// rp2040 port expects of guard holders). Returns false once the console is
+// gone or backpressure persists; callers drop the rest of the message.
+static bool consoleWriteCharGuarded(char c) {
+#if defined(USE_TINYUSB) && defined(ARDUINO_ARCH_RP2040)
+  for (int spins = 0; spins < 1000; ++spins) {
+    if (!Serial) {
+      return false;  // no host attached: drop, as the unguarded wrapper would
+    }
+    bool wrote = false;
+    if (usbGuardTryEnter()) {
+      if (Serial.availableForWrite() > 0) {
+        Serial.write(static_cast<uint8_t>(c));
+        wrote = true;
+      } else {
+        tud_task();
+      }
+      usbGuardExit();
+    }
+    if (wrote) {
+      return true;
+    }
+  }
+  return false;
+#else
+  Serial.write(static_cast<uint8_t>(c));
+  return true;
+#endif
+}
+
 static void streamWriteNormalized(Stream& stream, const char* text) {
+  (void)stream;  // console output always goes to Serial (CDC0)
   if (text == nullptr) {
     return;
   }
@@ -111,9 +162,13 @@ static void streamWriteNormalized(Stream& stream, const char* text) {
   while (*text != '\0') {
     const char c = *text++;
     if (c == '\n' && prev != '\r') {
-      stream.write('\r');
+      if (!consoleWriteCharGuarded('\r')) {
+        return;
+      }
     }
-    stream.write(static_cast<uint8_t>(c));
+    if (!consoleWriteCharGuarded(c)) {
+      return;
+    }
     prev = c;
   }
 }

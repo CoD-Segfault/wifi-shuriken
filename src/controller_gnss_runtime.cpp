@@ -6,6 +6,15 @@
 #if defined(USE_TINYUSB)
 #include <Adafruit_TinyUSB.h>
 #include "class/cdc/cdc_device.h"
+#if defined(ARDUINO_ARCH_RP2040)
+#include <pico/mutex.h>
+// Owned by the Adafruit TinyUSB rp2040 port. tud_task() runs in IRQ context
+// there and is skipped while this mutex is held, so every tud_* call from
+// thread context must hold it: an unguarded call can be preempted mid
+// endpoint-claim by the IRQ-side tud_task, which then blocks forever on the
+// usbd mutex its own core still owns (core0 wedges, watchdog reboots).
+extern mutex_t __usb_mutex;
+#endif
 #endif
 
 #include "Configuration.h"
@@ -38,12 +47,30 @@ static inline void nmeaPassthroughWriteChar(char c) {
 #elif defined(USE_TINYUSB)
   // Bypass the Arduino CDC wrapper here because it drops writes unless the
   // host asserts DTR. gpsd often opens the tty without doing that.
-  if (tud_cdc_n_ready(NMEA_PASSTHROUGH_CDC_INSTANCE)) {
-    tud_cdc_n_write_char(NMEA_PASSTHROUGH_CDC_INSTANCE, c);
-    if (c == '\n') {
-      tud_cdc_n_write_flush(NMEA_PASSTHROUGH_CDC_INSTANCE);
-    }
+  // Buffer a whole sentence and push it under __usb_mutex in one go; a
+  // sentence is dropped rather than ever blocking against the USB IRQ.
+  static char line[128];
+  static size_t line_len = 0;
+  if (line_len < sizeof(line)) {
+    line[line_len++] = c;
   }
+  if (c != '\n') {
+    return;
+  }
+  const size_t len = line_len;
+  line_len = 0;
+#if defined(ARDUINO_ARCH_RP2040)
+  if (!mutex_try_enter(&__usb_mutex, NULL)) {
+    return;
+  }
+#endif
+  if (tud_cdc_n_ready(NMEA_PASSTHROUGH_CDC_INSTANCE)) {
+    tud_cdc_n_write(NMEA_PASSTHROUGH_CDC_INSTANCE, line, len);
+    tud_cdc_n_write_flush(NMEA_PASSTHROUGH_CDC_INSTANCE);
+  }
+#if defined(ARDUINO_ARCH_RP2040)
+  mutex_exit(&__usb_mutex);
+#endif
 #else
   Serial.write(static_cast<uint8_t>(c));
 #endif
@@ -148,10 +175,19 @@ bool controllerPhoneGnssRuntimeService(TinyGPSPlus& gps_phone,
 #if defined(USE_TINYUSB)
   // Drain NMEA sentences arriving from the Android app on the shared NMEA CDC
   // port. The app sends standard NMEA (GPRMC/GPGGA) which TinyGPS++ parses
-  // the same way it does hardware output.
-  while (nmea_passthrough_cdc.available()) {
-    gps_phone.encode(static_cast<char>(nmea_passthrough_cdc.read()));
+  // the same way it does hardware output. Reading re-arms the OUT endpoint,
+  // so it needs the same __usb_mutex guard as the mirror writes; on
+  // contention the buffered bytes just wait for the next loop pass.
+#if defined(ARDUINO_ARCH_RP2040)
+  if (mutex_try_enter(&__usb_mutex, NULL)) {
+#endif
+    while (nmea_passthrough_cdc.available()) {
+      gps_phone.encode(static_cast<char>(nmea_passthrough_cdc.read()));
+    }
+#if defined(ARDUINO_ARCH_RP2040)
+    mutex_exit(&__usb_mutex);
   }
+#endif
 #endif
 
   // Accept the phone fix if location is present and fresh. Satellite count is
