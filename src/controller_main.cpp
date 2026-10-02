@@ -471,8 +471,16 @@ void loop() {
   const bool usable_fix = usable_hw_fix || usable_phone_fix;
 
   // Point the logger at whichever source has a valid fix. Hardware GPS takes
-  // priority; phone GPS is the fallback when the module has no lock.
-  logging.setGpsSource(usable_hw_fix ? &gps : &gps_phone);
+  // priority; phone GPS is the fallback when the module has no lock. Falling
+  // back to hardware when neither qualifies matters because the logger applies
+  // a looser per-field rule than the usable-fix test: a module reporting a
+  // fresh RMC position before its first parsable GGA fails the satellite
+  // threshold here, but still has coordinates and a clock the logger can use.
+  TinyGPSPlus* gps_source = &gps;
+  if (!usable_hw_fix && usable_phone_fix) {
+    gps_source = &gps_phone;
+  }
+  logging.setGpsSource(gps_source);
 
   maybeRequestDedupeResetOnFixAcquire(usable_fix);
   logging.syncMasterClockFromGnss();
