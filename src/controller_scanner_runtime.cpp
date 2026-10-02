@@ -35,13 +35,17 @@ static constexpr uint8_t SCANNER_RESULT_DRAIN_BUDGET = 16;
 static constexpr uint8_t SCANNER_RESULT_COUNT_RESPONSE_PULLS = 8;
 // The ESP32 SPI slave needs a short gap after each command transaction to
 // process the just-received frame and queue the response for the next pull.
-static constexpr uint16_t SCANNER_STATUS_FIRST_PULL_US = SCANNER_STATUS_FIRST_PULL_DELAY_US;
+// uint32_t, not uint16_t: both delays are documented as overridable via build
+// flags and scannerCommandWithResponse() already takes a uint32_t, so a
+// narrower type here silently wraps any override above 65535us into a much
+// shorter wait rather than failing the build.
+static constexpr uint32_t SCANNER_STATUS_FIRST_PULL_US = SCANNER_STATUS_FIRST_PULL_DELAY_US;
 static constexpr uint8_t SCANNER_SCAN_CMD_RETRIES = 2;
 static constexpr uint8_t SCANNER_QUERY_CMD_RETRIES = 2;
 static constexpr uint8_t SCANNER_RESULT_COUNT_CMD_RETRIES = 2;
 static constexpr uint8_t SCANNER_RESULT_GET_CMD_RETRIES = 2;
 // Keep a short guard gap after CMD_SCAN before the first response pull.
-static constexpr uint16_t SCANNER_SCAN_FIRST_PULL_US = SCANNER_SCAN_FIRST_PULL_DELAY_US;
+static constexpr uint32_t SCANNER_SCAN_FIRST_PULL_US = SCANNER_SCAN_FIRST_PULL_DELAY_US;
 static constexpr uint8_t SCANNER_SCAN_BUSY_CONFIRM_POLLS = 2;
 static constexpr uint16_t SCANNER_SCAN_BUSY_CONFIRM_DELAY_US = 2500;
 static constexpr uint32_t SCANNER_OTA_SPI_HZ = SCANNER_SPI_UPDATE_CLOCK;
