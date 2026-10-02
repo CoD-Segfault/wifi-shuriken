@@ -80,9 +80,14 @@ static void configureGnssBaudToTarget() {
     GNSS_UART.end();
     gnssUartBeginWithConfiguredBuffer(probe_bauds[i]);
     delay(30);
+#if CONTROLLER_GNSS_TARGET_BAUD == 115200
+    // The trailing *1F is a checksum over "PMTK251,115200", so this sentence is
+    // only valid at the default target. At any other target baud it would be a
+    // malformed command, and MTK modules are simply left at their current rate.
     GNSS_UART.println("$PMTK251,115200*1F");
     GNSS_UART.flush();
     delay(80);
+#endif
   }
 
   GNSS_UART.end();

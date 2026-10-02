@@ -6,7 +6,12 @@ class TinyGPSPlus;
 
 // Shared GNSS timing thresholds used both by the GNSS runtime and the
 // controller logging config.
-static constexpr uint32_t CONTROLLER_GNSS_TARGET_BAUD = 115200;
+// A macro rather than a constexpr so the preprocessor can test it: the MTK
+// baud command below carries a precomputed checksum that is only valid at one
+// baud, and that has to be guarded at compile time.
+#ifndef CONTROLLER_GNSS_TARGET_BAUD
+#define CONTROLLER_GNSS_TARGET_BAUD 115200
+#endif
 static constexpr uint16_t CONTROLLER_GPS_FIELD_MAX_AGE_MS = 3000;
 static constexpr uint16_t CONTROLLER_GNSS_BOOT_TIMESTAMP_WAIT_MS = 6000;
 static constexpr uint8_t CONTROLLER_GNSS_BOOT_TIMESTAMP_READS = 5;
