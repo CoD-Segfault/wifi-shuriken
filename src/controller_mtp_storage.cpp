@@ -29,7 +29,13 @@ struct MtpObject {
 class MtpUsbInterface : public Adafruit_USBD_Interface {
  public:
   bool begin() {
-    setStringDescriptor("SD");
+    // Must be exactly "MTP": libmtp identifies an MTP responder by matching this
+    // interface string descriptor, and gvfs/file managers go through libmtp. Any
+    // other value (it used to say "SD") leaves the device classified as a plain
+    // PTP camera, which gphoto2 then fails to talk to. The volume name the host
+    // actually displays is the storage description sent in GetStorageInfo, not
+    // this string, so naming it "MTP" costs nothing user-visible.
+    setStringDescriptor("MTP");
     return TinyUSBDevice.addInterface(*this);
   }
 
@@ -488,6 +494,7 @@ int32_t sendObject(tud_mtp_cb_data_t* cb, bool partial) {
   const uint32_t total = partial ? std::min(available, command->params[2]) : available;
   const uint32_t chunk = std::min(remainingBytes(total, transferred),
                                   cb->io_container.payload_bytes);
+  const uint32_t command_container_len = cb->io_container.header->len;
   if (cb->phase == MTP_PHASE_COMMAND) {
     if (!transfer_file.seekSet(requested_offset)) {
       releaseObjectTransferLock();
@@ -501,7 +508,23 @@ int32_t sendObject(tud_mtp_cb_data_t* cb, bool partial) {
       return MTP_RESP_GENERAL_ERROR;
     }
   }
-  tud_mtp_data_send(&cb->io_container);
+  if (!tud_mtp_data_send(&cb->io_container)) {
+    // The stack has already entered the data phase but submitted no transfer,
+    // so tud_mtp_data_complete_cb() will never run and nothing else would drop
+    // the SD lock. Leaving it held stops every later appendCsvRow(),
+    // flushCsvIfDue() and tryRecoverSdLogging() for the rest of the session.
+    releaseObjectTransferLock();
+    if (cb->phase == MTP_PHASE_COMMAND) {
+      // This container carries its own header, so a response can still be
+      // built from it once the data length added above is undone.
+      cb->io_container.header->len = command_container_len;
+      return MTP_RESP_DEVICE_BUSY;
+    }
+    // Data-phase containers are headerless: the payload aliases the raw
+    // endpoint buffer, so a response sent from here would be stale file bytes
+    // on the wire. Stay silent and let the host time out instead.
+    return 0;
+  }
   return 0;
 }
 
