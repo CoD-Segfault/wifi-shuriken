@@ -52,6 +52,32 @@ static volatile uint32_t wd_core1_last_ms = 0;
 static uint32_t last_reported_scan_queue_drops = 0;
 static uint32_t last_reported_dedupe_drops = 0;
 
+// Diagnostic output must never wait for a USB host. In particular, TinyUSB's
+// CDC write() waits indefinitely when DTR is asserted but the host stops
+// reading. This Stream drops excess output instead, while preserving all
+// non-console controller work.
+class NonBlockingConsoleStream : public Stream {
+ public:
+  int available() override { return Serial.available(); }
+  int read() override { return Serial.read(); }
+  int peek() override { return Serial.peek(); }
+  void flush() override {}
+
+  size_t write(uint8_t byte) override {
+    return Serial.availableForWrite() == 0 ? 0 : Serial.write(byte);
+  }
+
+  size_t write(const uint8_t* buffer, size_t length) override {
+    if (buffer == nullptr || length == 0) {
+      return 0;
+    }
+    const size_t writable = Serial.availableForWrite();
+    const size_t count = length < writable ? length : writable;
+    return count == 0 ? 0 : Serial.write(buffer, count);
+  }
+};
+static NonBlockingConsoleStream nonblocking_console;
+
 // Controller-wide dedupe storage used to suppress duplicate results arriving
 // from different scanner slots during the same operating session.
 static constexpr uint16_t MASTER_DEDUPE_CAPACITY = WIFI_DEDUPE_TABLE_CAPACITY;
@@ -83,7 +109,8 @@ static const pico_logging::Config logging_config = {
   CSV_LOG_FLUSH_INTERVAL_MS,
   CONTROLLER_GNSS_MIN_VALID_YEAR
 };
-static pico_logging::Logger logging(sd, logFile, gps, GNSS_UART, Serial, logging_config, logging_state);
+static pico_logging::Logger logging(sd, logFile, gps, GNSS_UART,
+                                    nonblocking_console, logging_config, logging_state);
 
 static const char* controllerResetReasonToString(RP2040::resetReason_t reason) {
   switch (reason) {
@@ -101,7 +128,9 @@ static const char* controllerResetReasonToString(RP2040::resetReason_t reason) {
 }
 
 // Normalize outgoing console text to CRLF so host tools on Linux and Windows
-// render the controller console consistently.
+// render the controller console consistently. USB CDC writes block while DTR
+// remains asserted and the host does not drain its TX FIFO, so diagnostics must
+// be lossy rather than stall core0 and trigger the watchdog.
 static void streamWriteNormalized(Stream& stream, const char* text) {
   if (text == nullptr) {
     return;
@@ -111,9 +140,14 @@ static void streamWriteNormalized(Stream& stream, const char* text) {
   while (*text != '\0') {
     const char c = *text++;
     if (c == '\n' && prev != '\r') {
-      stream.write('\r');
+      if (stream.availableForWrite() == 0 || stream.write('\r') != 1) {
+        return;
+      }
     }
-    stream.write(static_cast<uint8_t>(c));
+    if (stream.availableForWrite() == 0 ||
+        stream.write(static_cast<uint8_t>(c)) != 1) {
+      return;
+    }
     prev = c;
   }
 }

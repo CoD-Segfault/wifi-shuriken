@@ -148,9 +148,15 @@ bool controllerPhoneGnssRuntimeService(TinyGPSPlus& gps_phone,
 #if defined(USE_TINYUSB)
   // Drain NMEA sentences arriving from the Android app on the shared NMEA CDC
   // port. The app sends standard NMEA (GPRMC/GPGGA) which TinyGPS++ parses
-  // the same way it does hardware output.
-  while (nmea_passthrough_cdc.available()) {
+  // the same way it does hardware output. Keep this bounded so a continuously
+  // replenished USB RX buffer cannot prevent core0 from returning to loop()
+  // and feeding the watchdog. TinyGPS++ retains partial sentences between calls.
+  static constexpr uint16_t PHONE_NMEA_DRAIN_BUDGET = 256;
+  uint16_t bytes_drained = 0;
+  while (bytes_drained < PHONE_NMEA_DRAIN_BUDGET &&
+         nmea_passthrough_cdc.available()) {
     gps_phone.encode(static_cast<char>(nmea_passthrough_cdc.read()));
+    bytes_drained++;
   }
 #endif
 
