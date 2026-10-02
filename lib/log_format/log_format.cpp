@@ -62,13 +62,21 @@ void formatBssid(const uint8_t* bssid, char* out, size_t out_len) {
 void csvEscape(const char* in, char* out, size_t out_len) {
   size_t j = 0;
   if (out_len == 0) return;
+  // Anything shorter cannot hold both quotes plus the terminator.
+  if (out_len < 3) {
+    out[0] = '\0';
+    return;
+  }
   out[j++] = '"';
-  for (size_t i = 0; in[i] != '\0' && j + 2 < out_len; i++) {
+  for (size_t i = 0; in[i] != '\0'; i++) {
     if (in[i] == '"') {
-      if (j + 2 >= out_len) break;
+      // A doubled quote costs two slots, so it needs one more byte of
+      // headroom than a plain character before the closing quote and NUL.
+      if (j + 3 >= out_len) break;
       out[j++] = '"';
       out[j++] = '"';
     } else {
+      if (j + 2 >= out_len) break;
       out[j++] = in[i];
     }
   }

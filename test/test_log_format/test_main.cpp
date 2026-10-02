@@ -27,6 +27,39 @@ void test_csvEscape_truncates_safely() {
   TEST_ASSERT_EQUAL_STRING("\"abcde\"", out);
 }
 
+void test_csvEscape_quote_run_stays_inside_buffer() {
+  // A run of quotes emits two bytes per input byte, which previously let the
+  // cursor reach out_len - 1 and pushed the terminator one byte past the end.
+  char guarded[16];
+  memset(guarded, '#', sizeof(guarded));
+  pico_logging::csvEscape("\"\"\"\"\"", guarded, 8);
+  TEST_ASSERT_EQUAL_STRING("\"\"\"\"\"\"", guarded);
+  TEST_ASSERT_EQUAL_CHAR('#', guarded[8]);
+}
+
+void test_csvEscape_handles_buffers_too_small_to_quote() {
+  char guarded[8];
+
+  memset(guarded, '#', sizeof(guarded));
+  pico_logging::csvEscape("abc", guarded, 0);
+  TEST_ASSERT_EQUAL_CHAR('#', guarded[0]);
+
+  memset(guarded, '#', sizeof(guarded));
+  pico_logging::csvEscape("abc", guarded, 1);
+  TEST_ASSERT_EQUAL_STRING("", guarded);
+  TEST_ASSERT_EQUAL_CHAR('#', guarded[1]);
+
+  memset(guarded, '#', sizeof(guarded));
+  pico_logging::csvEscape("abc", guarded, 2);
+  TEST_ASSERT_EQUAL_STRING("", guarded);
+  TEST_ASSERT_EQUAL_CHAR('#', guarded[2]);
+
+  memset(guarded, '#', sizeof(guarded));
+  pico_logging::csvEscape("abc", guarded, 3);
+  TEST_ASSERT_EQUAL_STRING("\"\"", guarded);
+  TEST_ASSERT_EQUAL_CHAR('#', guarded[3]);
+}
+
 void test_buildAndroidCapabilitiesString_open_and_ess() {
   char out[96] = {};
   pico_logging::buildAndroidCapabilitiesString(0, out, sizeof(out));
@@ -137,6 +170,8 @@ int main(int argc, char** argv) {
   RUN_TEST(test_formatBssid_outputs_uppercase_mac);
   RUN_TEST(test_csvEscape_quotes_and_escapes_quotes);
   RUN_TEST(test_csvEscape_truncates_safely);
+  RUN_TEST(test_csvEscape_quote_run_stays_inside_buffer);
+  RUN_TEST(test_csvEscape_handles_buffers_too_small_to_quote);
   RUN_TEST(test_buildAndroidCapabilitiesString_open_and_ess);
   RUN_TEST(test_buildAndroidCapabilitiesString_wep_and_ess);
   RUN_TEST(test_buildAndroidCapabilitiesString_wpa2_psk_ccmp);
