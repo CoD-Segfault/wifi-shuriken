@@ -54,8 +54,14 @@ static constexpr uint8_t SCAN_RESULT_PROCESS_BUDGET = 16;
 static constexpr size_t FRAME_SIZE = SPI_FRAME_SIZE;
 static constexpr size_t FRAME_TAG_INDEX = SPI_FRAME_TAG_INDEX;
 
-static uint8_t rx_buf[FRAME_SIZE] __attribute__((aligned(4)));
-static uint8_t tx_buf[FRAME_SIZE] __attribute__((aligned(4)));
+// Aligned to a cache line, not just a word. These are DMA targets on a cached
+// chip: a 64-byte buffer aligned only to 4 straddles two cache lines, and the
+// line that DMA does not invalidate keeps serving the CPU its stale cached copy.
+// Since rx_buf is cleared immediately before each transfer is armed, that stale
+// copy reads back as zeros -- which silently blanked every command payload while
+// leaving byte 0 intact.
+static uint8_t rx_buf[FRAME_SIZE] __attribute__((aligned(64)));
+static uint8_t tx_buf[FRAME_SIZE] __attribute__((aligned(64)));
 
 // Boot diagnostics are emitted repeatedly for a short window so they remain visible
 // even when USB CDC enumeration lags behind firmware startup.
@@ -81,6 +87,8 @@ static int scan_index = 0;     // next raw result index to process
 static WiFiResult spi_results[PROTO_MAX_RESULTS] = {};
 static uint8_t spi_result_count = 0;
 static uint8_t spi_result_index = 0;
+// Set when a result packet is staged in tx_buf but not yet clocked out.
+static bool spi_result_emit_pending = false;
 // Master-visible status: 0=idle, -1=busy (scan/processing), >0=buffered results available.
 static int8_t spi_status = SCANNER_STATUS_OK;
 static uint8_t last_scan_band = 0;
@@ -205,11 +213,34 @@ static void clear_scan_results() {
 static void clear_spi_result_buffer() {
   spi_result_count = 0;
   spi_result_index = 0;
+  spi_result_emit_pending = false;
 }
 
 static inline void setResultBufferIdle() {
   spi_status = SCANNER_STATUS_OK;
   clear_spi_result_buffer();
+}
+
+// A RESULT_GET reply is staged into tx_buf but is not clocked out until the
+// next transaction completes. Advancing the buffer position at staging time
+// discards the record if that transaction never happens, so the advance waits
+// here until the frame has demonstrably gone out on the wire.
+static void commitPendingResultEmit() {
+  if (!spi_result_emit_pending) {
+    return;
+  }
+  spi_result_emit_pending = false;
+  if (spi_result_index >= spi_result_count) {
+    return;
+  }
+
+  spi_result_index++;
+  const int remaining = (int)spi_result_count - (int)spi_result_index;
+  if (remaining > 0) {
+    spi_status = static_cast<int8_t>(remaining);
+  } else {
+    setResultBufferIdle();
+  }
 }
 
 static inline void setScanEngineIdle() {
@@ -594,18 +625,15 @@ static void handleCmdResultGet() {
     return;
   }
 
-  const WiFiResult& r = spi_results[spi_result_index++];
+  // Stage the packet only. commitPendingResultEmit() moves past this record
+  // once the transaction that carries it has completed, so a reply the master
+  // never managed to pull is re-delivered instead of being skipped.
+  const WiFiResult& r = spi_results[spi_result_index];
   write_result_packet(RESULT_WIFI, &r);
-
-  const int remaining = (int)spi_result_count - (int)spi_result_index;
-  if (remaining > 0) {
-    spi_status = static_cast<int8_t>(remaining);
-  } else {
-    setResultBufferIdle();
-  }
+  spi_result_emit_pending = true;
 
   DBG_PRINTF("[SPI] rsp RESULT_GET => WIFI out=%u/%u ssid='%s' rssi=%d ch=%u band=%u\n",
-             (unsigned)spi_result_index, (unsigned)spi_result_count,
+             (unsigned)(spi_result_index + 1), (unsigned)spi_result_count,
              r.ssid, r.rssi, r.channel, r.band);
 }
 
@@ -878,6 +906,14 @@ static void handle_command(uint8_t cmd_byte) {
 void setup() {
 #if SCANNER_SERIAL_LOG || DEBUG_SPI_PROTOCOL
   Serial.begin(115200);
+#if defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT
+  // Only the USB CDC has this control; on the devkit Serial is a plain UART.
+  // The CDC blocks by default once its TX buffer fills, which happens as soon
+  // as a host enumerates the port but nothing drains it. A blocking write
+  // inside a command handler delays re-queueing the slave DMA transaction, so
+  // drop console output instead of stalling the SPI critical path.
+  Serial.setTxTimeoutMs(0);
+#endif
 #endif
   boot_reset_reason = esp_reset_reason();
   boot_diag_next_ms = 0;
@@ -920,8 +956,10 @@ void loop() {
   // Always progress scan state even if the master is quiet.
   update_scan_state();
 
-  // Ensure rx_buf doesn't contain stale data (not strictly required, but helps debugging).
-  memset(rx_buf, 0, FRAME_SIZE);
+  // rx_buf is deliberately not cleared here. After a timeout the transaction
+  // stays armed with rx_buf as its DMA target, so the master can complete a
+  // frame into it while this loop is still in update_scan_state() above.
+  // scannerSpiSlaveTransfer() clears it while re-arming instead.
 
   // Wait for a SPI transaction; timeout keeps async scan polling progressing.
   const int ret = scannerSpiSlaveTransfer(tx_buf, rx_buf, FRAME_SIZE, SPI_RX_TIMEOUT_MS);
@@ -935,6 +973,10 @@ void loop() {
     DBG_PRINTF("[SPI] spi_slave_transmit error: %d\n", ret);
     return;
   }
+
+  // This transaction clocked out whatever the previous command staged, so a
+  // result packet waiting on that has now reached the master.
+  commitPendingResultEmit();
 
   if (ota_restart_pending) {
     delay(OTA_RESTART_DELAY_MS);

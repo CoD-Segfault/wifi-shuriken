@@ -40,6 +40,26 @@ bool scannerSpiSlaveInit(int pin_sck,
     return false;
   }
 
+  // The controller tri-states the 74HC595 CS outputs while it shifts a new
+  // select byte, so without a pull-up CS floats twice per frame. A line that
+  // drifts low turns the shift-register byte (or another slot's frame) into a
+  // transaction on this scanner, which then drives MISO while another slot is
+  // selected and garbles the whole bus. spi_slave_initialize() leaves the pull
+  // mode alone; the ESP-IDF slave example sets these after init for the same
+  // reason. SCK/MOSI get the same treatment so an unplugged master does not
+  // clock rogue transactions in.
+  const int pulled_pins[] = {pin_cs, pin_sck, pin_mosi};
+  for (int pin : pulled_pins) {
+    if (pin < 0) {
+      continue;
+    }
+    const esp_err_t pull_ret = gpio_set_pull_mode(
+      static_cast<gpio_num_t>(pin), GPIO_PULLUP_ONLY);
+    if (pull_ret != ESP_OK) {
+      return false;
+    }
+  }
+
   const esp_err_t drive_ret = gpio_set_drive_capability(
     static_cast<gpio_num_t>(pin_miso),
     static_cast<gpio_drive_cap_t>(SCANNER_SPI_MISO_DRIVE_CAP));
@@ -63,6 +83,11 @@ int scannerSpiSlaveTransfer(const uint8_t* tx_buf,
 
   // Queue one persistent transaction if none is currently pending.
   if (!g_trans_queued) {
+    // Clearing the receive buffer is only safe here. Once the transaction is
+    // queued the SPI driver owns rx_buf and may complete a frame into it at any
+    // time, including while the caller is busy between transfers, so a caller
+    // that cleared it itself would race the ISR and wipe a received command.
+    memset(rx_buf, 0, frame_size);
     memset(&g_pending_trans, 0, sizeof(g_pending_trans));
     g_pending_trans.length = frame_size * 8;
     g_pending_trans.tx_buffer = tx_buf;
