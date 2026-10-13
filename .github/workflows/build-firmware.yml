@@ -27,21 +27,20 @@ jobs:
             : > platformio.local.ini
           fi
 
-      - name: Build all firmware environments
+      - name: Build XIAO firmware environments
         run: |
           pio run \
-            -e pico2_controller \
             -e xiao_rp2350_controller \
-            -e esp32c5_devkit_scanner \
             -e xiao_esp32c5_scanner
 
       - name: Collect build artifacts
         run: |
-          mkdir -p dist
-          cp .pio/build/pico2_controller/firmware.uf2 dist/pico2_controller.uf2
+          mkdir -p dist/sd-card-updates
           cp .pio/build/xiao_rp2350_controller/firmware.uf2 dist/xiao_rp2350_controller.uf2
-          cp .pio/build/esp32c5_devkit_scanner/firmware.factory.bin dist/esp32c5_devkit_scanner-merged.bin
           cp .pio/build/xiao_esp32c5_scanner/firmware.factory.bin dist/xiao_esp32c5_scanner-merged.bin
+          cp .pio/build/xiao_rp2350_controller/firmware.bin dist/sd-card-updates/controller.bin
+          cp .pio/build/xiao_esp32c5_scanner/firmware.bin dist/sd-card-updates/scanner.bin
+          cp docs/sd-card-updates.md dist/sd-card-updates/README.md
 
       - name: Upload firmware artifacts
         uses: actions/upload-artifact@v4

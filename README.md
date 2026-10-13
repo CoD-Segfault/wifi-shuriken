@@ -6,6 +6,21 @@ The controller handles functions such as USB serial, GNSS, SD logging, and scan 
 
 Each ESP32-C5 scanner runs as an SPI slave and exposes a small command protocol for identity, scan requests, result counts, and result retrieval. Scan results are deduplicated and buffered on the scanner, then deduplicated again at the controller before being written to WiGLE CSV format with timestamp and position data from the GNSS subsystem.
 
+## Firmware downloads
+
+The GitHub Actions `Build Firmware` workflow builds only the XIAO RP2350 controller
+and XIAO ESP32-C5 scanner. Download its `firmware-artifacts` archive:
+
+- `xiao_rp2350_controller.uf2`: RP2350 USB BOOTSEL flashing.
+- `xiao_esp32c5_scanner-merged.bin`: ESP32-C5 USB flashing image.
+- `sd-card-updates/controller.bin`: RP2350 SD card update image.
+- `sd-card-updates/scanner.bin`: ESP32-C5 SPI update image, read from the SD card.
+- `sd-card-updates/README.md`: instructions included with the update images.
+
+For SD updates, copy the desired binaries to the card's **root**, keeping the
+`controller.bin` and `scanner.bin` filenames. The installed firmware must support
+SD updates. See [SD card update instructions](docs/sd-card-updates.md).
+
 ## USB SD card access
 
 The controller exposes the SD card automatically as a read-only MTP device while
