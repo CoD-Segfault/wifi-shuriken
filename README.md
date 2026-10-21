@@ -8,7 +8,7 @@ Each ESP32-C5 scanner runs as an SPI slave and exposes a small command protocol 
 
 ## Firmware downloads
 
-An experimental Waveshare P4 target is available on the `ble-testing` branch.
+An experimental Waveshare P4 target is available on the `p4-controller` branch.
 See [P4 SDMMC/BLE bring-up](docs/p4-controller.md) for its build command, hardware
 setup, and limitations. It is not yet a replacement for the full RP2350 controller.
 
