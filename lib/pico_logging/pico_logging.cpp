@@ -3,6 +3,10 @@
 
 #include <SPI.h>
 
+#if defined(SHURIKEN_P4_CONTROLLER)
+#include "../../src/p4/sdmmc_storage.h"
+#endif
+
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -70,15 +74,19 @@ void getBoardUidHex(char* out, size_t out_len) {
     pos += static_cast<size_t>(written);
   }
   out[pos] = '\0';
+#elif defined(SHURIKEN_P4_CONTROLLER)
+  snprintf(out, out_len, "%012llX", static_cast<unsigned long long>(ESP.getEfuseMac()));
 #endif
 }
 
 }  // namespace
 
+#if !defined(SHURIKEN_P4_CONTROLLER)
 Logger* Logger::date_time_callback_instance_ = nullptr;
+#endif
 
-Logger::Logger(SdFat& sd,
-               FsFile& log_file,
+Logger::Logger(LogStorage& sd,
+               LogFile& log_file,
                TinyGPSPlus& gps,
                HardwareSerial& gnss_uart,
                Stream& serial,
@@ -110,8 +118,11 @@ void Logger::initUtcTimezone() {
 }
 
 void Logger::registerSdDateTimeCallback() {
+#if !defined(SHURIKEN_P4_CONTROLLER)
   date_time_callback_instance_ = this;
   SdFile::dateTimeCallback(sdDateTimeCallbackThunk);
+#endif
+  // P4 FatFs VFS uses the system clock, synchronized below from GNSS.
 }
 
 void Logger::setBootResetReason(uint8_t reason_code, const char* reason_text) {
@@ -126,6 +137,7 @@ void Logger::setBootResetReason(uint8_t reason_code, const char* reason_text) {
   state_.boot_reset_reason[sizeof(state_.boot_reset_reason) - 1] = '\0';
 }
 
+#if !defined(SHURIKEN_P4_CONTROLLER)
 void Logger::sdDateTimeCallbackThunk(uint16_t* date, uint16_t* time) {
   if (date_time_callback_instance_) {
     date_time_callback_instance_->sdDateTimeCallback(date, time);
@@ -134,6 +146,7 @@ void Logger::sdDateTimeCallbackThunk(uint16_t* date, uint16_t* time) {
   *date = FS_DATE(1980, 1, 1);
   *time = FS_TIME(0, 0, 0);
 }
+#endif
 
 bool Logger::gnssDateTimeValid() const {
   return gps_ptr_->date.isValid() &&
@@ -255,7 +268,14 @@ void Logger::syncMasterClockFromGnss() {
 }
 
 bool Logger::ensureBootTimestampFromClock() {
+#if defined(SHURIKEN_P4_CONTROLLER) && !P4_REQUIRE_GNSS_TIME_FOR_LOGGING
+  const bool has_fallback_timestamp =
+      strcmp(state_.csv_boot_timestamp, "NO_GNSS_TIME") == 0;
+  if (state_.csv_boot_timestamp[0] != '\0' &&
+      (!has_fallback_timestamp || state_.csv_path_selected)) {
+#else
   if (state_.csv_boot_timestamp[0] != '\0') {
+#endif
     return true;
   }
 
@@ -263,7 +283,16 @@ bool Logger::ensureBootTimestampFromClock() {
 
   uint32_t epoch = 0;
   if (!masterClockNowEpochSeconds(epoch)) {
+#if defined(SHURIKEN_P4_CONTROLLER) && !P4_REQUIRE_GNSS_TIME_FOR_LOGGING
+    snprintf(state_.csv_boot_timestamp,
+             sizeof(state_.csv_boot_timestamp),
+             "%s",
+             "NO_GNSS_TIME");
+    serial_.println("No valid clock; using NO_GNSS_TIME for CSV filename");
+    return true;
+#else
     return false;
+#endif
   }
 
   const time_t now = (time_t)epoch;
@@ -281,6 +310,7 @@ bool Logger::ensureBootTimestampFromClock() {
   return true;
 }
 
+#if !defined(SHURIKEN_P4_CONTROLLER)
 void Logger::sdDateTimeCallback(uint16_t* date, uint16_t* time) {
   uint16_t y = 1980;
   uint8_t mon = 1;
@@ -327,6 +357,7 @@ void Logger::sdDateTimeCallback(uint16_t* date, uint16_t* time) {
   *date = FS_DATE(y, mon, d);
   *time = FS_TIME(h, min, s);
 }
+#endif
 
 void Logger::formatGpsTimestamp(char* out, size_t out_len) const {
   uint32_t epoch = 0;
@@ -363,7 +394,7 @@ void Logger::tryAppendBootResetLog() {
   }
 
   const bool exists = sd_.exists(RESET_LOG_PATH);
-  FsFile reset_log = sd_.open(RESET_LOG_PATH, O_RDWR | O_CREAT | O_APPEND);
+  LogFile reset_log = openLogAppend(sd_, RESET_LOG_PATH);
   if (!reset_log) {
     serial_.println("Reset log open failed; will retry");
     return;
@@ -459,6 +490,12 @@ bool Logger::selectCsvLogPath() {
 }
 
 bool Logger::beginSdAtClock(uint32_t hz) {
+#if defined(SHURIKEN_P4_CONTROLLER)
+  (void)hz;  // SDMMC owns its mount policy, not SPI clock probing.
+  const bool ready = p4::storageBegin();
+  serial_.println(ready ? "SDMMC storage ready" : "SDMMC mount unavailable (no formatting)");
+  return ready;
+#else
   const SdSpiConfig cfg(config_.sd_pin_cs, DEDICATED_SPI, hz, &SPI);
   if (sd_.begin(cfg)) {
     serial_.print("SD initialized at ");
@@ -478,6 +515,7 @@ bool Logger::beginSdAtClock(uint32_t hz) {
   serial_.println(sd_.sdErrorData(), HEX);
   delay(20);
   return false;
+#endif
 }
 
 bool Logger::beginSdAtAnyClock() {
@@ -514,7 +552,7 @@ bool Logger::mountSdWithRetries(int max_attempts) {
 
 bool Logger::initCsvLog(const char* path) {
   const bool exists = sd_.exists(path);
-  log_file_ = sd_.open(path, O_RDWR | O_CREAT | O_APPEND);
+  log_file_ = openLogAppend(sd_, path);
   if (!log_file_) return false;
 
   if (!exists || log_file_.size() == 0) {
@@ -537,6 +575,10 @@ bool Logger::initCsvLog(const char* path) {
     log_file_.println(header);
     log_file_.println("MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type");
     log_file_.flush();
+  }
+  if (log_file_.getWriteError()) {
+    log_file_.close();
+    return false;
   }
   state_.csv_dirty = false;
   state_.csv_last_flush_ms = millis();

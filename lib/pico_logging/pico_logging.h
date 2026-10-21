@@ -1,8 +1,9 @@
 #pragma once
 
 #include <Arduino.h>
-#include <SdFat.h>
+#include "log_storage.h"
 #include <TinyGPSPlus.h>
+#include "controller_scan_result.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -10,15 +11,6 @@
 #include "../log_format/log_format.h"
 
 namespace pico_logging {
-
-struct QueuedScanResult {
-  char ssid[33];
-  uint8_t bssid[6];
-  int8_t rssi;
-  uint8_t channel;
-  uint8_t band;
-  uint16_t capabilities;
-};
 
 struct Config {
   uint8_t sd_pin_cs;
@@ -55,8 +47,8 @@ struct State {
 
 class Logger {
  public:
-  Logger(SdFat& sd,
-         FsFile& log_file,
+  Logger(LogStorage& sd,
+         LogFile& log_file,
          TinyGPSPlus& gps,
          HardwareSerial& gnss_uart,
          Stream& serial,
@@ -102,8 +94,8 @@ class Logger {
   bool beginSdAtClock(uint32_t hz);
   bool beginSdAtAnyClock();
 
-  SdFat& sd_;
-  FsFile& log_file_;
+  LogStorage& sd_;
+  LogFile& log_file_;
   TinyGPSPlus* gps_ptr_;
   HardwareSerial& gnss_uart_;
   Stream& serial_;

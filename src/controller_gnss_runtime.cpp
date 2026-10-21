@@ -61,12 +61,21 @@ static void gnssUartBeginWithConfiguredBuffer(uint32_t baud) {
   static bool fifo_warned = false;
   // The Arduino-Pico FIFO resize can fail on some targets; warn once and keep
   // going with the default buffer instead of spamming the console.
-  if (!GNSS_UART.setFIFOSize(SERIAL_BUFFER_SIZE) && !fifo_warned) {
+#if defined(SHURIKEN_P4_CONTROLLER)
+  const bool resized = GNSS_UART.setRxBufferSize(SERIAL_BUFFER_SIZE) != 0;
+#else
+  const bool resized = GNSS_UART.setFIFOSize(SERIAL_BUFFER_SIZE);
+#endif
+  if (!resized && !fifo_warned) {
     Serial.print("Warning: GNSS UART FIFO resize failed, keeping default. requested=");
     Serial.println((unsigned)SERIAL_BUFFER_SIZE);
     fifo_warned = true;
   }
+#if defined(SHURIKEN_P4_CONTROLLER)
+  GNSS_UART.begin(baud, SERIAL_8N1, GNSS_RX, GNSS_TX);
+#else
   GNSS_UART.begin(baud);
+#endif
 }
 
 static void configureGnssBaudToTarget() {
@@ -100,8 +109,10 @@ static void configureGnssBaudToTarget() {
 }
 
 void controllerGnssRuntimeInitUart() {
+#if !defined(SHURIKEN_P4_CONTROLLER)
   GNSS_UART.setTX(GNSS_TX);
   GNSS_UART.setRX(GNSS_RX);
+#endif
   configureGnssBaudToTarget();
 }
 
@@ -129,7 +140,12 @@ bool controllerGnssRuntimeService(TinyGPSPlus& gps,
                                   uint16_t gps_field_max_age_ms) {
   // Keep the GNSS UART drained aggressively so TinyGPS++ parsing and optional
   // NMEA mirroring do not fall behind while core0 is also handling SD writes.
+#if defined(SHURIKEN_P4_CONTROLLER)
+  uint16_t drained = 0;
+  while (drained++ < 512 && GNSS_UART.available()) {
+#else
   while (GNSS_UART.available()) {
+#endif
     char c = GNSS_UART.read();
     gps.encode(c);
 

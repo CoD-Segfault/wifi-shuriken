@@ -1,16 +1,28 @@
 #include "controller_scanner_runtime.h"
 
 #include <Arduino.h>
+#if !defined(SHURIKEN_P4_CONTROLLER)
 #include <Adafruit_NeoPixel.h>
+#endif
 #include <SPI.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
+#if defined(SHURIKEN_P4_CONTROLLER)
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <esp_task_wdt.h>
+#include <driver/gpio.h>
+static SPIClass scanner_spi(FSPI);
+#define SCANNER_SPI scanner_spi
+#else
 #include "hardware/gpio.h"
 #include "pico/time.h"
+#define SCANNER_SPI SPI1
+#endif
 #include "channel_scheduler.h"
-#include "pico_logging.h"
+#include "log_format.h"
 #include "spi_protocol_shared.h"
 #include "wifi_result_utils.h"
 #include "Configuration.h"
@@ -196,9 +208,9 @@ static inline void scannerShiftRegWriteCsState(uint8_t state, bool force) {
     scannerShiftRegSetOutputsEnabled(false);
   }
   scanner_cs_shiftreg_state = state;
-  SPI1.beginTransaction(SPISettings(SCANNER_SHIFTREG_SPI_HZ, MSBFIRST, SPI_MODE0));
-  SPI1.transfer(scanner_cs_shiftreg_state);
-  SPI1.endTransaction();
+  SCANNER_SPI.beginTransaction(SPISettings(SCANNER_SHIFTREG_SPI_HZ, MSBFIRST, SPI_MODE0));
+  SCANNER_SPI.transfer(scanner_cs_shiftreg_state);
+  SCANNER_SPI.endTransaction();
   digitalWrite(SCANNER_SHIFTREG_LATCH_PIN, HIGH);
   digitalWrite(SCANNER_SHIFTREG_LATCH_PIN, LOW);
   if (restore_outputs) {
@@ -215,8 +227,13 @@ static inline void advanceSweepChannelAndLog(ChannelScheduleState& schedule_stat
   if (channelScheduleAdvance(schedule_state)) {
     if (timing_active) {
       const uint32_t elapsed_ms = millis() - started_ms;
+#if defined(SHURIKEN_P4_CONTROLLER)
+      __atomic_store_n(scanner_runtime_context.last_full_sweep_ms, elapsed_ms, __ATOMIC_RELAXED);
+      __atomic_fetch_add(scanner_runtime_context.sweep_cycles_completed, 1, __ATOMIC_RELAXED);
+#else
       *scanner_runtime_context.last_full_sweep_ms = elapsed_ms;
       (*scanner_runtime_context.sweep_cycles_completed)++;
+#endif
       scannerSerialPrintfTry("Completed full 2.4G + 5G coverage cycle in %lums\n",
                              (unsigned long)elapsed_ms);
       timing_active = false;
@@ -227,6 +244,18 @@ static inline void advanceSweepChannelAndLog(ChannelScheduleState& schedule_stat
 }
 
 static void scannerTransferFrame(const uint8_t* tx, uint8_t* rx) {
+#if defined(SHURIKEN_P4_CONTROLLER)
+  // Scanner-worker-owned timing: cover every frame, including a new command
+  // immediately after a successful reply, not just failed-response polls.
+  static bool have_previous_frame = false;
+  static uint32_t previous_frame_end_us = 0;
+  if (have_previous_frame) {
+    const uint32_t elapsed_us = static_cast<uint32_t>(micros()) - previous_frame_end_us;
+    if (elapsed_us < P4_SCANNER_FRAME_GAP_US) {
+      delayMicroseconds(P4_SCANNER_FRAME_GAP_US - elapsed_us);
+    }
+  }
+#endif
 #if SCANNER_USE_SHIFTREG_CS
   // Active-low CS via shift-register output slot.
   const uint8_t assert_state = (uint8_t)(0xFFu & ~(1u << scanner_active_slot));
@@ -235,25 +264,35 @@ static void scannerTransferFrame(const uint8_t* tx, uint8_t* rx) {
   digitalWrite(SCANNER_PIN_CS, LOW);
 #endif
   const uint32_t spi_hz = scanner_ota_transport_active ? SCANNER_OTA_SPI_HZ : SCANNER_SPI_HZ;
-  SPI1.beginTransaction(SPISettings(spi_hz, MSBFIRST, SPI_MODE0));
+  SCANNER_SPI.beginTransaction(SPISettings(spi_hz, MSBFIRST, SPI_MODE0));
+#if defined(SHURIKEN_P4_CONTROLLER)
+  delayMicroseconds(P4_SCANNER_CS_SETUP_US);
+#endif
 
   // The slave protocol is fixed-length and full-duplex, so every command and
   // poll is exactly one 64-byte transfer.
   for (size_t i = 0; i < SCANNER_FRAME_SIZE; i++) {
     const uint8_t t = tx ? tx[i] : 0;
-    const uint8_t r = SPI1.transfer(t);
+    const uint8_t r = SCANNER_SPI.transfer(t);
     if (rx) {
       rx[i] = r;
     }
   }
 
-  SPI1.endTransaction();
+#if defined(SHURIKEN_P4_CONTROLLER)
+  delayMicroseconds(P4_SCANNER_CS_HOLD_US);
+#endif
+  SCANNER_SPI.endTransaction();
 #if SCANNER_USE_SHIFTREG_CS
   // Deassert all scanner CS outputs.
   const uint8_t deassert_state = 0xFFu;
   scannerShiftRegWriteCsState(deassert_state, false);
 #else
   digitalWrite(SCANNER_PIN_CS, HIGH);
+#endif
+#if defined(SHURIKEN_P4_CONTROLLER)
+  previous_frame_end_us = static_cast<uint32_t>(micros());
+  have_previous_frame = true;
 #endif
 }
 
@@ -330,7 +369,7 @@ static void handlePendingDedupeResetRequest() {
   scannerSerialPrintlnTry("Controller dedupe reset requested (deferred until slot idle)");
 }
 
-void controllerScannerRuntimeInitBus() {
+bool controllerScannerRuntimeInitBus() {
   // Bring the scanner bus to a safe idle state before core1 starts polling.
 #if SCANNER_USE_SHIFTREG_CS
   pinMode(SCANNER_SHIFTREG_LATCH_PIN, OUTPUT);
@@ -342,6 +381,17 @@ void controllerScannerRuntimeInitBus() {
   digitalWrite(SCANNER_PIN_CS, HIGH);
   pinMode(SCANNER_PIN_CS, OUTPUT);
 #endif
+#if defined(SHURIKEN_P4_CONTROLLER)
+  if (!SCANNER_SPI.begin(SCANNER_PIN_SCK, SCANNER_PIN_MISO, SCANNER_PIN_MOSI, -1)) return false;
+#if SCANNER_MISO_PULLUP
+  // pinMode() would reclaim MISO from Arduino's peripheral manager and
+  // detach its SPI input routing. Change only the pad pull-up instead.
+  if (gpio_pullup_en(static_cast<gpio_num_t>(SCANNER_PIN_MISO)) != ESP_OK) {
+    SCANNER_SPI.end();
+    return false;  // CS outputs remain disabled on initialization failure.
+  }
+#endif
+#else
 #if SCANNER_MISO_PULLUP
   gpio_pull_up(SCANNER_PIN_MISO);
 #endif
@@ -352,12 +402,14 @@ void controllerScannerRuntimeInitBus() {
 #if SCANNER_MISO_PULLUP
   gpio_pull_up(SCANNER_PIN_MISO);
 #endif
+#endif
 #if SCANNER_USE_SHIFTREG_CS
   scannerSetActiveSlot(SCANNER_INITIAL_SLOT);
   scannerShiftRegWriteCsState(0xFFu, true);
   // Keep outputs enabled in idle once all scanner CS lines are safely deasserted.
   scannerShiftRegSetOutputsEnabled(true);
 #endif
+  return true;
 }
 
 static bool scannerGetDeviceId(DeviceIdReply& out) {
@@ -379,6 +431,7 @@ static bool scannerGetDeviceId(DeviceIdReply& out) {
   return false;
 }
 
+#if !defined(SHURIKEN_P4_CONTROLLER)
 static const char* scannerOtaStatusToString(int8_t status) {
   switch (status) {
     case OTA_STATUS_OK: return "OK";
@@ -929,6 +982,8 @@ bool controllerScannerRuntimeHandleScannerUpdatesFromSd(SdFat& sd,
 #endif
 }
 
+#endif  // P4 scanner firmware updating is not ported yet.
+
 static bool ensureScannerSlotIdentity(uint8_t slot, ScannerSlotState& state) {
   // Slot identity is cached until transport failures force a re-probe. This
   // keeps empty slots from consuming controller bandwidth every pass.
@@ -1353,7 +1408,11 @@ static void processScannerSlot(uint8_t slot,
       // Controller-side dedupe suppresses duplicates across all scanners, not
       // just within the reporting slot.
       if (!wifiDedupeTableRemember(scanner_runtime_context.master_dedupe_table, &hash)) {
+#if defined(SHURIKEN_P4_CONTROLLER)
+        __atomic_fetch_add(scanner_runtime_context.dedupe_drops, 1, __ATOMIC_RELAXED);
+#else
         (*scanner_runtime_context.dedupe_drops)++;
+#endif
         batch_dedupe_hits++;
 #if LOG_DEDUPE_HITS
 #if CONTROLLER_LOG_INDIVIDUAL_DEDUPE_HITS
@@ -1381,8 +1440,12 @@ static void processScannerSlot(uint8_t slot,
       q.channel = pkt.result.channel;
       q.band = pkt.result.band;
       q.capabilities = pkt.result.capabilities;
-      if (!queue_try_add(scanner_runtime_context.scan_result_queue, &q)) {
+      if (!scanner_runtime_context.queue_result_try(q)) {
+#if defined(SHURIKEN_P4_CONTROLLER)
+        __atomic_fetch_add(scanner_runtime_context.scan_queue_drops, 1, __ATOMIC_RELAXED);
+#else
         (*scanner_runtime_context.scan_queue_drops)++;
+#endif
       }
       continue;
     }
@@ -1420,6 +1483,10 @@ void controllerScannerRuntimeRun(const ControllerScannerRuntimeContext& context)
   // context and launches this loop on the second core.
   scanner_runtime_context = context;
   scanner_slot = SCANNER_INITIAL_SLOT;
+#if defined(SHURIKEN_P4_CONTROLLER)
+  const bool taskWatched = esp_task_wdt_add(nullptr) == ESP_OK;
+  if (!taskWatched) scannerSerialPrintlnTry("Warning: scanner task watchdog registration failed");
+#endif
 
   scannerSerialPrintlnTry("Core1 SPI loop started");
 #if SCANNER_USE_SHIFTREG_CS
@@ -1434,8 +1501,12 @@ void controllerScannerRuntimeRun(const ControllerScannerRuntimeContext& context)
 
   while (true) {
     if (scanner_runtime_context.wd_core1_last_ms != nullptr) {
+#if defined(SHURIKEN_P4_CONTROLLER)
+      __atomic_store_n(scanner_runtime_context.wd_core1_last_ms, millis(), __ATOMIC_RELAXED);
+#else
       *scanner_runtime_context.wd_core1_last_ms =
           to_ms_since_boot(get_absolute_time());
+#endif
     }
     handlePendingDedupeResetRequest();
     // Each iteration services exactly one slot; round-robin when shift-reg CS is enabled.
@@ -1447,8 +1518,22 @@ void controllerScannerRuntimeRun(const ControllerScannerRuntimeContext& context)
                          scanner_sweep_timing_active,
                          scanner_sweep_started_ms);
     }
+#if defined(SHURIKEN_P4_CONTROLLER)
+    if (scanner_runtime_context.scanner_presence_mask) {
+      const uint32_t bit = 1u << scanner_slot;
+      if (scanner_slot_state[scanner_slot].id_valid) {
+        __atomic_fetch_or(scanner_runtime_context.scanner_presence_mask, bit, __ATOMIC_RELAXED);
+      } else {
+        __atomic_fetch_and(scanner_runtime_context.scanner_presence_mask, ~bit, __ATOMIC_RELAXED);
+      }
+    }
+#endif
 #if SCANNER_USE_SHIFTREG_CS
     scanner_slot = (uint8_t)((scanner_slot + 1u) % SCANNER_SLOT_COUNT);
+#endif
+#if defined(SHURIKEN_P4_CONTROLLER)
+    if (taskWatched) esp_task_wdt_reset();
+    vTaskDelay(1);  // Yield even when all scanner slots are absent.
 #endif
   }
 }

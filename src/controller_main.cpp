@@ -295,7 +295,7 @@ void loop2() {
   // core1 only needs the shared runtime context and then hands control to the
   // scanner module permanently.
   const ControllerScannerRuntimeContext scanner_runtime = {
-    &scan_result_queue,
+    [](const QueuedScanResult& result) { return queue_try_add(&scan_result_queue, &result); },
     &scan_queue_drops,
     &dedupe_drops,
     &sweep_cycles_completed,

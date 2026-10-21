@@ -8,6 +8,10 @@ Each ESP32-C5 scanner runs as an SPI slave and exposes a small command protocol 
 
 ## Firmware downloads
 
+An experimental Waveshare P4 target is available on the `ble-testing` branch.
+See [P4 SDMMC/BLE bring-up](docs/p4-controller.md) for its build command, hardware
+setup, and limitations. It is not yet a replacement for the full RP2350 controller.
+
 The GitHub Actions `Build Firmware` workflow builds only the XIAO RP2350 controller
 and XIAO ESP32-C5 scanner. Download its `firmware-artifacts` archive:
 

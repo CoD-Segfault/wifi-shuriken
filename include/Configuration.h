@@ -1,5 +1,9 @@
 #pragma once
 
+#if defined(SHURIKEN_P4_CONTROLLER)
+#include "p4_controller_config.h"
+#endif
+
 // Firmware version used in CSV metadata fields.
 #ifndef APP_VERSION
 #define APP_VERSION "0.2"
