@@ -1,0 +1,26 @@
+name: Controller HAL regressions
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+jobs:
+  controllers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build and filesystem test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ pkg-config libftdi1-dev libxxhash-dev dosfstools exfatprogs
+          python -m pip install "platformio==6.2"
+          touch platformio.local.ini
+      - name: Build controllers and run every host regression
+        run: python test/run_regressions.py --firmware
+      - name: Compile the real Tigard USB adapter
+        run: |
+          cmake -S pc -B .pio/pc -DSHURIKEN_TIGARD=ON
+          cmake --build .pio/pc -j 4
+          ctest --test-dir .pio/pc --output-on-failure

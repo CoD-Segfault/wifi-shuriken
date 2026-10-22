@@ -73,7 +73,7 @@ def parse_macro_from_cppdefines(macro_name: str) -> Optional[str]:
 def parse_macro_from_project_files(project_dir: Path, macro_name: str) -> Optional[str]:
     # Prefer the known controller source, then search src/include for portability.
     candidates = [
-        project_dir / "src" / "controller_main.cpp",
+        project_dir / "src" / "controller" / "main.cpp",
         project_dir / "src" / "pico_master.cpp",  # legacy filename fallback
     ]
     for root in ("src", "include"):

@@ -44,7 +44,8 @@ DRESULT disk_ioctl(BYTE drive, BYTE command, void *buffer)
 
 void *ff_memalloc(unsigned size) { return malloc(size); }
 void ff_memfree(void *buffer) { free(buffer); }
-DWORD get_fattime(void) { return (DWORD)(2026 - 1980) << 25 | 10U << 21 | 20U << 16; }
+static DWORD clock_time = (DWORD)(2026 - 1980) << 25 | 10U << 21 | 20U << 16;
+DWORD get_fattime(void) { return clock_time; }
 int ff_mutex_create(int volume) { (void)volume; return 1; }
 void ff_mutex_delete(int volume) { (void)volume; }
 int ff_mutex_take(int volume) { (void)volume; return 1; }
@@ -79,6 +80,17 @@ int main(int argc, char **argv)
     assert(f_mount(&fs, "0:", 1) == FR_OK);
     assert(f_stat("0:/Compatibility test/Renamed file.bin", &info) == FR_OK);
     assert(info.fsize == sizeof(expected));
+    // The stored date survives flush/remount on every supported filesystem.
+    assert(info.fdate == ((2026U - 1980U) << 9 | 10U << 5 | 20U));
+    assert(info.ftime == 0);
+    // A later write/flush records the current RTC time rather than creation time.
+    clock_time |= 20U << 11 | 9U << 5 | 29U; /* 20:09:58, two-second FAT resolution */
+    assert(f_open(&file, "0:/Compatibility test/Renamed file.bin", FA_WRITE) == FR_OK);
+    assert(f_write(&file, expected, 1, &count) == FR_OK && count == 1);
+    assert(f_sync(&file) == FR_OK);
+    assert(f_close(&file) == FR_OK);
+    assert(f_stat("0:/Compatibility test/Renamed file.bin", &info) == FR_OK);
+    assert(info.ftime == (20U << 11 | 9U << 5 | 29U));
     assert(f_open(&file, "0:/Compatibility test/Renamed file.bin", FA_READ) == FR_OK);
     assert(f_read(&file, actual, sizeof(actual), &count) == FR_OK);
     assert(count == sizeof(actual) && memcmp(expected, actual, sizeof(actual)) == 0);

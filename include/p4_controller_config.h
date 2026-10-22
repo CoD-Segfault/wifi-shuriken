@@ -41,6 +41,9 @@
 #ifndef GNSS_RX
 #define GNSS_RX 33
 #endif
+#ifndef P4_USB_NMEA
+#define P4_USB_NMEA 0
+#endif
 #ifndef NMEA_PASSTHROUGH
 #define NMEA_PASSTHROUGH 0
 #endif
@@ -48,7 +51,7 @@
 #define SCANNER_SPI_UPDATE_ENABLED 0
 #endif
 #ifndef P4_REQUIRE_GNSS_TIME_FOR_LOGGING
-#define P4_REQUIRE_GNSS_TIME_FOR_LOGGING 0
+#define P4_REQUIRE_GNSS_TIME_FOR_LOGGING 1
 #endif
 
 namespace p4_pins {
@@ -67,3 +70,12 @@ static_assert(valid(), "P4 external pins must be unique and in the available GPI
 static_assert(SCANNER_USE_SHIFTREG_CS == 1 && SCANNER_SHIFTREG_OUTPUTS == 6,
               "P4 controller currently supports six shift-register scanner slots");
 }  // namespace p4_pins
+
+// Scanner OTA uses the same conservative bus rate as normal P4 frames.
+#ifndef SCANNER_SPI_UPDATE_CLOCK
+#define SCANNER_SPI_UPDATE_CLOCK SCANNER_SPI_CLOCK
+#endif
+
+#ifndef P4_USB_MTP
+#define P4_USB_MTP 0
+#endif

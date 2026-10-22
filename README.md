@@ -12,6 +12,11 @@ An experimental Waveshare P4 target is available on the `p4-controller` branch.
 See [P4 SDMMC/BLE bring-up](docs/p4-controller.md) for its build command, hardware
 setup, and limitations. It is not yet a replacement for the full RP2350 controller.
 
+The `controller-hal` development branch adds shared controller interfaces and a
+PC/Tigard backend. All controller targets use one shared application and runtime;
+board setup and peripherals live in backend adapters. See
+[Controller HAL development and tests](docs/controller-hal.md).
+
 The GitHub Actions `Build Firmware` workflow builds only the XIAO RP2350 controller
 and XIAO ESP32-C5 scanner. Download its `firmware-artifacts` archive:
 

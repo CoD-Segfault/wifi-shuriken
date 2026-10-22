@@ -3,8 +3,9 @@
 The `waveshare_p4_controller` environment builds on the hardware-tested
 `p4_testing` SDMMC/BLE bring-up. It now runs the shared six-scanner scheduler,
 UART GNSS parser, deduplication, and WiGLE CSV logger alongside BLE UART.
-The scanner/GNSS/logger integration still needs hardware validation. MTP and
-controller/scanner firmware updates are not ported. Existing XIAO and Pico
+The native USB variant includes read-only SD MTP; its composite USB behavior
+still needs hardware validation. Controller firmware updates are not ported.
+Existing XIAO and Pico
 environments and default build targets are unchanged.
 
 ## Build and upload
@@ -21,6 +22,74 @@ The target pins [pioarduino release `55.03.312`](https://github.com/pioarduino/p
 FatFs headers. Board ID `esp32-p4_r3-evboard` intentionally selects production
 revision-3 P4 support and the `esp32p4` variant; do not bypass revision checks.
 Monitor uses `Serial0`, 115200 baud, with local echo; upload uses 921600 baud.
+
+For the native USB OTG connector, use the separate console variant:
+
+```sh
+pio run -e waveshare_p4_usb_controller
+pio run -e waveshare_p4_usb_controller -t upload --upload-port /dev/serial/by-id/<UART-adapter>
+pio device monitor -b 115200 --port /dev/serial/by-id/<native-USB-device>
+```
+
+The base board definition selects `ARDUINO_USB_MODE=1` (hardware USB Serial/JTAG),
+which does not start the high-speed OTG device. The USB variant removes that
+setting, selects `ARDUINO_USB_MODE=0`, retains CDC-on-boot and routes application
+console I/O to `Serial`/TinyUSB. The normal `waveshare_p4_controller` still uses
+`Serial0` on the UART programming connector.
+
+On [Waveshare ESP32-P4-WIFI6](https://www.waveshare.com/wiki/ESP32-P4-WIFI6),
+the Type-C programming connector and four-pin high-speed USB OTG connector are
+separate. The programming connector is one upload option. Native HS USB also
+supports ROM download: close both CDC clients, hold BOOT, press and release RESET,
+then release BOOT. Select the serial device that appears in download mode and run:
+
+```sh
+pio run -e waveshare_p4_usb_controller -t upload --upload-port /dev/ttyACM0
+```
+
+Replace `/dev/ttyACM0` with the ROM download device on your machine. Reset after
+upload if the application does not restart automatically, then reopen its CDC
+ports. The ROM device replaces the application console/NMEA pair during flashing.
+The pinned Arduino SDK implements its CDC reboot-to-bootloader helper only for
+ESP32-S2/S3, so the P4 native console currently requires manual BOOT/RESET entry;
+a 1200-baud touch does not enter download mode. See Espressif
+[USB download guidance](https://docs.espressif.com/projects/esp-techpedia/en/latest/esp-friends/get-started/try-firmware/try-firmware-hardware/esp32p4.html).
+
+Use a data cable and an OTG device connection
+to the host. There is no indefinite wait for a terminal; if startup messages are
+missed, send `:status` or wait for the periodic status output. This variant exposes
+two CDC interfaces: CDC0 is the application console and CDC1 is raw NMEA.
+Low-level SDK messages may still use UART. After flashing, reopen the native USB
+device so the host discovers both serial ports; do not assume fixed tty numbers.
+
+The native USB variant also exposes an **MTP** interface for browsing and copying
+root-level SD files, alongside both CDC ports. Reflash and reconnect the USB cable
+so the host discovers the new composite device. Open Shuriken / SD in an
+MTP-capable file manager. Writes, deletion and formatting are unsupported.
+Directory entries are visible, but their children are not exported; files larger
+than the ordinary MTP 32-bit object-size limit are omitted. Refresh/reopen the
+storage listing to discover newly created logs.
+
+MTP object information reports the SD file's stored modification time in UTC,
+refreshed on each metadata request. FatFs records write times from the system
+clock synchronized by GNSS, at FAT's two-second resolution. Existing stored dates
+are preserved; unknown dates are not replaced with the current time.
+
+The logger flushes before listing, inspecting or opening files. Downloads use a
+size snapshot, so a currently growing CSV is consistent through its advertised
+length; reopen it to fetch later rows. Reads run in bounded 4 KiB chunks from the
+application loop, sharing its SD owner with logging. A slow/disconnected host
+never holds a logging lock. Active transfers release their read handle on cancel,
+USB reset or disconnect. The normal UART build does not expose MTP.
+
+The second port accepts checksum-bearing RMC/GGA sentences as the shared USB
+GNSS source. It also mirrors the hardware UART's raw NMEA output by default
+(`NMEA_PASSTHROUGH=1` in the USB variant). Incoming USB data feeds the parser,
+not the receiver UART or console. A conventional 115200 baud setting is suitable;
+CDC data transfer does not depend on that virtual baud rate. NMEA output does
+not require DTR and is best-effort/nonblocking when the host is slow or absent.
+The NMEA interface does not implement Arduino's 1200-baud reboot gesture.
+
 
 ## SD card
 
@@ -100,8 +169,8 @@ RP2350 controller so observations are logged again with location. Set
 scan log. Blank-time/location records may not be useful for WiGLE uploads.
 Reset diagnostics still wait for valid time. NMEA console passthrough is off
 by default. GPS selection prefers a usable UART fix, then USB NMEA where
-supported, then BLE NMEA. The P4 USB-CDC NMEA port is not implemented yet, so
-its currently usable sources are UART and BLE. If none qualifies, the logger
+supported, then BLE NMEA. The native `waveshare_p4_usb_controller` build supports
+all three sources; the UART-console build supports UART and BLE. If none qualifies, the logger
 retains the hardware parser's clock/per-field fallback behavior.
 
 To supply phone GNSS, write standard checksum-bearing RMC/GGA sentences with
@@ -169,7 +238,8 @@ synchronization, dedupe policy, or the active CSV file. Debugging is off at boot
 
 Each source shows its usable-fix state, position and age, altitude/HDOP/satellites
 with their ages, NMEA UTC/date/time ages, parsed-character and checksum counters,
-and fix-bearing sentence count. USB is explicitly unavailable on P4. Counters
+and fix-bearing sentence count. USB is available in the native USB build and
+explicitly unavailable in the UART-console build. Counters
 are NMEA statistics, not claimed GNSS update frequencies; BLE counters reset
 with its parser/session. Pairwise separation is printed only for fresh valid
 positions. All samples are the latest observations, not synchronized epochs:

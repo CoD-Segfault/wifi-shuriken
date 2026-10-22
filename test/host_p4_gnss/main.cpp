@@ -61,7 +61,7 @@ int main() {
   const bool locationUpdated = hw.location.isUpdated(), timeUpdated = hw.time.isUpdated();
   const p4::GpsDebugSource sources[3] = {{"UART", &hw, true, true}, {"USB", &usb, false, false}, {"BLE", &ble, true, true}};
   p4::GpsDebugReport report;
-  report.capture(sources, "UART", 3000);
+  report.capture(sources, "UART", 3000, millis());
   assert(report.size() == 7);
   std::string diagnostic;
   for (size_t i = 0; i < report.size(); ++i) {
@@ -76,10 +76,10 @@ int main() {
   assert(separation > 110 && separation < 112);
   assert(hw.location.isUpdated() == locationUpdated && hw.time.isUpdated() == timeUpdated);
   fakeMillis += 3000;
-  report.capture(sources, "none", 3000);
+  report.capture(sources, "none", 3000, millis());
   assert(std::string(report.line(report.size() - 1)).find("separation=unavailable") != std::string::npos);
   const p4::GpsDebugSource allSources[3] = {{"UART", &hw, true, false}, {"USB", &usb, true, false}, {"BLE", &ble, true, false}};
-  report.capture(allSources, "none", 3000);
+  report.capture(allSources, "none", 3000, millis());
   assert(report.size() == 10);  // All three source pairs fit in fixed memory.
   puts("PASS: GPS debug coordinates/time/separation, unavailable/stale sources, bounded reports, live parser flags preserved");
   puts("PASS: fragmented/multiple NMEA, RMC-only fixes, freshness, sessions/disconnect/drop isolation, checksum/size rejection, source priority");

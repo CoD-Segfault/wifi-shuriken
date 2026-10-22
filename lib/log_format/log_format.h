@@ -3,7 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-namespace pico_logging {
+namespace controller::logging {
 
 void formatBssid(const uint8_t* bssid, char* out, size_t out_len);
 void csvEscape(const char* in, char* out, size_t out_len);
@@ -21,4 +21,4 @@ bool buildCsvWifiRow(const uint8_t* bssid,
                      char* out,
                      size_t out_len);
 
-}  // namespace pico_logging
+}  // namespace controller::logging

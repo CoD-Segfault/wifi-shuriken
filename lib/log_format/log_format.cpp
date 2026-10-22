@@ -5,7 +5,7 @@
 
 #include "spi_protocol_shared.h"
 
-namespace pico_logging {
+namespace controller::logging {
 namespace {
 
 void appendAuthToken(char* out, size_t out_len, const char* token) {
@@ -172,5 +172,5 @@ bool buildCsvWifiRow(const uint8_t* bssid,
   return true;
 }
 
-}  // namespace pico_logging
+}  // namespace controller::logging
 
