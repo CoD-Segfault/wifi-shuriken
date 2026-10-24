@@ -508,6 +508,9 @@ void loop() {
     // Time-based flush closes the durability gap between row-count flushes.
     logging.flushCsvIfDue();
 
+    // Close any MTP reader before recovery can remount the SdFat volume.
+    controllerMtpStorageSetReady(logging_state.sd_ready);
+
     if (!logging_state.csv_ready) {
       logging.tryRecoverSdLogging();
     }

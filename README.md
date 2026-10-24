@@ -29,6 +29,15 @@ sharing raw FAT sectors, so the host cannot corrupt the card. Root-directory fil
 are refreshed when the host requests an object listing; the active CSV is flushed
 before it is listed or read. Root object handles are streamed across as many MTP
 packets as needed; nested directory contents and uploads/deletes are not exposed.
+Directories are omitted from the listing. Downloads use the file size captured
+at the start, allowing the logger to append between transfer chunks. Files too
+large for a 32-bit MTP container are rejected instead of wrapping the transfer
+length; partial reads remain available within the protocol's 32-bit offset range.
+File timestamps come from the card, with 1980-01-01 used when none is recorded.
+The read-only store reports zero space available for host writes, without scanning
+the entire FAT for physical free space. Abandoned transfers time out after five
+seconds without USB progress; hosts can recover with MTP reset or endpoint
+clear-halt, and the CDC console/GNSS interfaces remain available.
 Some hosts label the device as a camera because MTP uses the USB Still Image class.
 The host also constructs the `camera:/...@usb:.../store_...` URI; firmware-provided
 device, interface, and storage labels are kept short but cannot replace that URI.
